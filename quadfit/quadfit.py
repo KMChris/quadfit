@@ -9,6 +9,7 @@ from quadfitmodule import Line as _Line  # C extension
 from quadfitmodule import best_iou_quadrilateral as _best_iou_quad  # C accelerated
 from quadfitmodule import finetune_quadrilateral as _finetune_quad  # C accelerated
 from quadfitmodule import expand_quadrilateral as _expand_quad  # C accelerated
+from quadfitmodule import simplify_polygon_dp as _simplify_dp  # C accelerated
 
 class QuadrilateralFitter:
     def __init__(self, polygon: np.ndarray | tuple | list | Polygon):
@@ -136,12 +137,18 @@ class QuadrilateralFitter:
 
         :return: Polygon. A Shapely Polygon object representing the initial quadrilateral approximation.
         """
-        # Simplify the Convex Hull optionally (Shapely), then let C do the max-IoU selection among hull vertices
-        simplified_polygon = self.__simplify_polygon(polygon=self.convex_hull_polygon,
-                                                     max_sides=max_sides_to_simplify,
-                                                     initial_epsilon=start_simplification_epsilon,
-                                                     max_epsilon=max_simplification_epsilon,
-                                                     epsilon_increment=simplification_epsilon_increment)
+        # Simplify the Convex Hull optionally (C), then let C do the max-IoU selection among hull vertices
+        if max_sides_to_simplify is None:
+            simplified_polygon = self.convex_hull_polygon
+        else:
+            hull_coords = np.array(self.convex_hull_polygon.exterior.coords, dtype=np.float64)
+            simp = _simplify_dp(hull_coords,
+                                max_sides_to_simplify,
+                                start_simplification_epsilon,
+                                max_simplification_epsilon,
+                                simplification_epsilon_increment,
+                                0.8)
+            simplified_polygon = Polygon(np.asarray(simp))
 
         hull_coords = np.array(simplified_polygon.exterior.coords, dtype=np.float64)
         # C returns 4 vertices; we wrap them as a Shapely Polygon
@@ -196,66 +203,6 @@ class QuadrilateralFitter:
 
 
     # -------------------------------- HELPER METHODS -------------------------------- #
-
-    def __simplify_polygon(self, polygon: Polygon|GeometryCollection, max_sides: int | None,
-                           initial_epsilon: float = 0.1, max_epsilon: float = 0.5,
-                           epsilon_increment: float = 0.02, iou_threshold: float = 0.8):
-        """
-        Internal method to simplify a polygon using the Douglas-Peucker algorithm.
-        :param polygon: Polygon or GeometryCollection. The polygon or collection of geometries to simplify.
-        :param max_sides: int|None. The maximum number of sides the polygon can have after simplification.
-        If None, no simplification will be performed.
-        :param max_epsilon: float. The maximum tolerance value for the Douglas-Peucker algorithm.
-        :param initial_epsilon: float. The initial tolerance value for the Douglas-Peucker algorithm.
-        :param epsilon_increment: float. The incremental step for the tolerance value.
-
-         :return: Polygon. The simplified polygon.
-         """
-
-        if isinstance(polygon, Polygon):
-            polygon_to_simplify = polygon
-        elif isinstance(polygon, GeometryCollection):
-            # Find the first Polygon in the collection (assuming there's only one)
-            polygon_to_simplify = next((geom for geom in polygon.geoms if isinstance(geom, Polygon)), None)
-            if polygon_to_simplify is None:
-                raise ValueError("No Polygon found in GeometryCollection.")
-        else:
-            raise TypeError("Expected Polygon or GeometryCollection, got {type(polygon)}.")
-
-        # Now simplify the polygon_to_simplify
-        if polygon_to_simplify is None or max_sides is None or len(polygon_to_simplify.exterior.coords) - 1 <= max_sides:
-            return polygon_to_simplify  # No simplification needed
-
-        assert max_epsilon > 0., f"max_epsilon should be a float greater than 0. Got {max_epsilon}."
-        assert initial_epsilon > 0., f"initial_epsilon should be a float greater than 0. Got {initial_epsilon}."
-        assert epsilon_increment > 0., f"epsilon_increment should be a float greater than 0. Got {epsilon_increment}."
-
-        simplified_polygon = polygon_to_simplify
-        original_polygon_area = polygon_to_simplify.area
-
-        epsilon = initial_epsilon
-        while epsilon <= max_epsilon:
-            # Simplify the polygon
-            simplified_polygon_unconfirmed = simplified_polygon.simplify(epsilon, preserve_topology=True)
-            n_sides = len(simplified_polygon_unconfirmed.exterior.coords) - 1
-            # If the polygon has less than 4 sides, it becomes invalid, get the previous one
-            if n_sides < 4:
-                break
-            # If the polygon has less than max_sides, we have it. Return it or the previous one depending on the IoU
-            elif len(simplified_polygon_unconfirmed.exterior.coords) - 1 <= max_sides:
-                iou = self.__iou(polygon1=simplified_polygon_unconfirmed, polygon2=self.convex_hull_polygon,
-                                 precomputed_polygon_1_area=original_polygon_area)
-                # If the IoU is beyond the threshold, we accept the polygon. Otherwise, return the previous one
-                if iou > iou_threshold:
-                    # We accept the polygon
-                    simplified_polygon = simplified_polygon_unconfirmed
-                return simplified_polygon
-            else:
-                # If the polygon has more than max_sides, that's our best guess so far, but keep trying
-                simplified_polygon = simplified_polygon_unconfirmed
-                epsilon += epsilon_increment
-
-        return simplified_polygon
 
     def __iou(self, polygon1: Polygon, polygon2: Polygon, precomputed_polygon_1_area: float | None = None) -> float:
         """

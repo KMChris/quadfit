@@ -345,6 +345,7 @@ static PyObject* mod_polygon_vertices_from_lines(PyObject *self, PyObject *args)
 static PyObject* mod_best_iou_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs);
 static PyObject* mod_finetune_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs);
 static PyObject* mod_expand_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs);
+static PyObject* mod_simplify_polygon_dp(PyObject* self, PyObject* args, PyObject* kwargs);
 
 static PyMethodDef module_methods[] = {
     {"order_points_clockwise", (PyCFunction)mod_order_points_clockwise, METH_VARARGS, "Order Nx2 points clockwise"},
@@ -356,6 +357,7 @@ static PyMethodDef module_methods[] = {
     {"best_iou_quadrilateral", (PyCFunction)mod_best_iou_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Find quadrilateral (from hull vertices) with max IoU vs convex hull"},
     {"finetune_quadrilateral", (PyCFunction)mod_finetune_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Assign points to nearest side, fit TLS lines, return lines and vertices"},
     {"expand_quadrilateral", (PyCFunction)mod_expand_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Push lines outward to cover hull, return lines and vertices"},
+    {"simplify_polygon_dp", (PyCFunction)mod_simplify_polygon_dp, METH_VARARGS | METH_KEYWORDS, "Douglas–Peucker simplification for closed polygon with IoU threshold against original (convex)"},
     {NULL, NULL, 0, NULL}
 };
 
@@ -414,6 +416,19 @@ static double polygon_signed_area(const Pt* pts, int n) {
 static double polygon_area_abs(const Pt* pts, int n) {
     double a = polygon_signed_area(pts, n);
     return a < 0 ? -a : a;
+}
+
+// Ensure polygon is oriented counter-clockwise (CCW). In-place reverse if needed.
+static void ensure_ccw(Pt* pts, int n) {
+    if (n <= 2) return;
+    double s = polygon_signed_area(pts, n);
+    if (s < 0.0) {
+        for (int i = 0, j = n-1; i < j; ++i, --j) {
+            Pt tmp = pts[i];
+            pts[i] = pts[j];
+            pts[j] = tmp;
+        }
+    }
 }
 
 // Compute centroid of polygon (non-self-intersecting). Returns 0 on success, -1 if degenerate area.
@@ -547,6 +562,138 @@ static int load_points_from_array(PyArrayObject* arr, Pt** out_pts, int* out_n, 
     return 0;
 }
 
+// -------- Douglas–Peucker for closed polygon (treat as open polyline, then close) --------
+
+static double point_segment_distance(Pt p, Pt a, Pt b) {
+    double vx = b.x - a.x, vy = b.y - a.y;
+    double wx = p.x - a.x, wy = p.y - a.y;
+    double c1 = vx*wx + vy*wy;
+    if (c1 <= 0.0) {
+        double dx = p.x - a.x, dy = p.y - a.y; return sqrt(dx*dx + dy*dy);
+    }
+    double c2 = vx*vx + vy*vy;
+    if (c2 <= c1) {
+        double dx = p.x - b.x, dy = p.y - b.y; return sqrt(dx*dx + dy*dy);
+    }
+    double t = c1 / c2;
+    double projx = a.x + t*vx, projy = a.y + t*vy;
+    double dx = p.x - projx, dy = p.y - projy; return sqrt(dx*dx + dy*dy);
+}
+
+typedef struct { int i, j; } IntPair;
+
+static void dp_simplify(const Pt* pts, int n, double eps, char* keep) {
+    for (int i=0;i<n;i++) keep[i]=0;
+    keep[0]=1; keep[n-1]=1;
+    // simple stack
+    int cap = 64; int top = 0;
+    IntPair* st = (IntPair*)PyMem_Malloc(sizeof(IntPair)* (size_t)cap);
+    if (!st) return; // if OOM, keep endpoints only
+    st[top++] = (IntPair){0, n-1};
+    while (top>0) {
+        IntPair pr = st[--top];
+        int i = pr.i, j = pr.j;
+        double maxd = -1.0; int idx = -1;
+        Pt a = pts[i]; Pt b = pts[j];
+        for (int k=i+1;k<j;k++) {
+            double d = point_segment_distance(pts[k], a, b);
+            if (d > maxd) { maxd = d; idx = k; }
+        }
+        if (maxd > eps && idx > i && idx < j) {
+            keep[idx]=1;
+            if (top+2 > cap) {
+                int ncap = cap*2; IntPair* nst = (IntPair*)PyMem_Realloc(st, sizeof(IntPair)*(size_t)ncap);
+                if (!nst) continue; st = nst; cap = ncap;
+            }
+            st[top++] = (IntPair){i, idx};
+            st[top++] = (IntPair){idx, j};
+        }
+    }
+    PyMem_Free(st);
+}
+
+// simplify_polygon_dp(points, max_sides, initial_epsilon, max_epsilon, epsilon_increment, iou_threshold)
+static PyObject* mod_simplify_polygon_dp(PyObject* self, PyObject* args, PyObject* kwargs) {
+    static char* kwlist[] = {"points", "max_sides", "initial_epsilon", "max_epsilon", "epsilon_increment", "iou_threshold", NULL};
+    PyObject* points_obj=NULL; int max_sides=10; double initial_epsilon=0.1, max_epsilon=0.5, epsilon_increment=0.02, iou_threshold=0.8;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|idddd:simplify_polygon_dp", kwlist,
+        &points_obj, &max_sides, &initial_epsilon, &max_epsilon, &epsilon_increment, &iou_threshold)) return NULL;
+
+    PyArrayObject* arr=NULL; int r=0, c=2;
+    if (ensure_double_2d(points_obj, &arr, &r, &c) < 0) return NULL;
+    Pt* P=NULL; int N=0; if (load_points_from_array(arr, &P, &N, 1) < 0) { Py_DECREF(arr); return NULL; }
+    Py_DECREF(arr);
+    // No simplification if None-like behavior (negative or zero) or already <= max_sides
+    if (max_sides <= 0 || N <= max_sides) {
+        // return original with closing point duplicated
+        npy_intp dims[2] = {N+1, 2};
+        PyArrayObject* out = (PyArrayObject*)PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+        if (!out) { PyMem_Free(P); return NULL; }
+        double* o = (double*)PyArray_DATA(out);
+        for (int i=0;i<N;i++) { o[2*i]=P[i].x; o[2*i+1]=P[i].y; }
+        o[2*N]=P[0].x; o[2*N+1]=P[0].y; PyMem_Free(P);
+        return (PyObject*)out;
+    }
+
+    // Original area for IoU denom
+    double orig_area = polygon_area_abs(P, N);
+    // Work buffers
+    char* keep = (char*)PyMem_Malloc((size_t)N);
+    if (!keep) { PyMem_Free(P); PyErr_NoMemory(); return NULL; }
+
+    // Start with previous = original
+    Pt* prev_pts = (Pt*)PyMem_Malloc(sizeof(Pt)*(size_t)N);
+    if (!prev_pts) { PyMem_Free(P); PyMem_Free(keep); PyErr_NoMemory(); return NULL; }
+    for (int i=0;i<N;i++) prev_pts[i]=P[i];
+    int prev_n = N;
+
+    double eps = initial_epsilon;
+    while (eps <= max_epsilon + 1e-12) {
+        for (int i=0;i<N;i++) keep[i]=0;
+        dp_simplify(P, N, eps, keep);
+        // Build candidate
+        int cnt = 0; for (int i=0;i<N;i++) if (keep[i]) cnt++;
+        if (cnt < 4) break; // too few sides -> stop and return prev
+        Pt* cand = (Pt*)PyMem_Malloc(sizeof(Pt)*(size_t)cnt);
+        if (!cand) { PyMem_Free(P); PyMem_Free(keep); PyMem_Free(prev_pts); PyErr_NoMemory(); return NULL; }
+        int idx=0; for (int i=0;i<N;i++) if (keep[i]) { cand[idx++]=P[i]; }
+        if (cnt <= max_sides) {
+            double a = polygon_area_abs(cand, cnt);
+            double iou = (orig_area>0.0) ? (a / orig_area) : 0.0;
+            if (iou > iou_threshold) {
+                // accept and return
+                npy_intp dims[2] = {cnt+1, 2};
+                PyArrayObject* out = (PyArrayObject*)PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+                if (!out) { PyMem_Free(P); PyMem_Free(keep); PyMem_Free(prev_pts); PyMem_Free(cand); return NULL; }
+                double* o = (double*)PyArray_DATA(out);
+                for (int i=0;i<cnt;i++) { o[2*i]=cand[i].x; o[2*i+1]=cand[i].y; }
+                o[2*cnt]=cand[0].x; o[2*cnt+1]=cand[0].y;
+                PyMem_Free(P); PyMem_Free(keep); PyMem_Free(prev_pts); PyMem_Free(cand);
+                return (PyObject*)out;
+            }
+            // else return previous
+            PyMem_Free(cand);
+            break;
+        } else {
+            // keep as best-so-far, continue
+            PyMem_Free(prev_pts);
+            prev_pts = cand; prev_n = cnt;
+            eps += epsilon_increment;
+            continue;
+        }
+    }
+
+    // Return previous (best so far) closed ring
+    npy_intp dims[2] = {prev_n+1, 2};
+    PyArrayObject* out = (PyArrayObject*)PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+    if (!out) { PyMem_Free(P); PyMem_Free(keep); PyMem_Free(prev_pts); return NULL; }
+    double* o = (double*)PyArray_DATA(out);
+    for (int i=0;i<prev_n;i++) { o[2*i]=prev_pts[i].x; o[2*i+1]=prev_pts[i].y; }
+    o[2*prev_n]=prev_pts[0].x; o[2*prev_n+1]=prev_pts[0].y;
+    PyMem_Free(P); PyMem_Free(keep); PyMem_Free(prev_pts);
+    return (PyObject*)out;
+}
+
 static PyObject* make_line_from_abc(double A, double B, double C) {
     PyObject* args = PyTuple_New(0);
     if (!args) return NULL;
@@ -570,6 +717,9 @@ static PyObject* mod_best_iou_quadrilateral(PyObject* self, PyObject* args, PyOb
     if (load_points_from_array(arr, &hull, &nh, 1) < 0) { Py_DECREF(arr); return NULL; }
     Py_DECREF(arr);
     if (nh < 4) { PyMem_Free(hull); PyErr_SetString(PyExc_ValueError, "Need at least 4 hull points"); return NULL; }
+
+    // Enforce CCW orientation for hull (clip polygon assumes CCW: inside = left of edge)
+    ensure_ccw(hull, nh);
 
     if (seed_obj && seed_obj != Py_None) {
         long sd = PyLong_AsLong(seed_obj);
@@ -602,6 +752,8 @@ static PyObject* mod_best_iou_quadrilateral(PyObject* self, PyObject* args, PyOb
         for (int k=j+1;k<nh-1;k++)
         for (int l=k+1;l<nh;l++) {
             Pt quad[4] = {hull[i], hull[j], hull[k], hull[l]};
+            // Ensure quad is CCW for consistent area and clipping
+            ensure_ccw(quad, 4);
             double quad_area = polygon_area_abs(quad, 4);
             int in_n = convex_intersection(quad, 4, hull, nh, work, inter);
             double inter_area = (in_n>0) ? polygon_area_abs(inter, in_n) : 0.0;
@@ -640,6 +792,7 @@ static PyObject* mod_best_iou_quadrilateral(PyObject* self, PyObject* args, PyOb
         for (int m=0;m<picked;m++) {
             int i=combos[m][0], j=combos[m][1], k=combos[m][2], l=combos[m][3];
             Pt quad[4] = {hull[i], hull[j], hull[k], hull[l]};
+            ensure_ccw(quad, 4);
             double quad_area = polygon_area_abs(quad, 4);
             int in_n = convex_intersection(quad, 4, hull, nh, work, inter);
             double inter_area = (in_n>0) ? polygon_area_abs(inter, in_n) : 0.0;
@@ -673,7 +826,8 @@ static PyObject* mod_finetune_quadrilateral(PyObject* self, PyObject* args, PyOb
     if (ensure_double_2d(points_obj, &parr, &pr, &pc) < 0) return NULL;
     if (ensure_double_2d(initv_obj, &ivar, &ivr, &ivc) < 0) { Py_DECREF(parr); return NULL; }
     if (ivr < 4) { Py_DECREF(parr); Py_DECREF(ivar); PyErr_SetString(PyExc_AssertionError, "initial_vertices must be shape (4,2)"); return NULL; }
-    Pt* P=NULL; int NP=0; if (load_points_from_array(parr, &P, &NP, 0) < 0) { Py_DECREF(parr); Py_DECREF(ivar); return NULL; }
+    // When polygon coords include a duplicate last point equal to first, drop it
+    Pt* P=NULL; int NP=0; if (load_points_from_array(parr, &P, &NP, 1) < 0) { Py_DECREF(parr); Py_DECREF(ivar); return NULL; }
     Pt* V=NULL; int NV=0; if (load_points_from_array(ivar, &V, &NV, 0) < 0) { Py_DECREF(parr); Py_DECREF(ivar); PyMem_Free(P); return NULL; }
     Py_DECREF(parr); Py_DECREF(ivar);
     if (NV != 4) { PyMem_Free(P); PyMem_Free(V); PyErr_SetString(PyExc_AssertionError, "initial_vertices must have 4 rows"); return NULL; }
@@ -689,46 +843,44 @@ static PyObject* mod_finetune_quadrilateral(PyObject* self, PyObject* args, PyOb
         A[i]=a; B[i]=b; Cc[i]=c; Nn[i]=norm;
     }
 
-    // Assign points to nearest line (by perpendicular distance)
-    int counts[4] = {0,0,0,0};
-    double sumx[4] = {0,0,0,0}, sumy[4] = {0,0,0,0};
-    double sumxx[4] = {0,0,0,0}, sumyy[4] = {0,0,0,0}, sumxy[4] = {0,0,0,0};
-    for (int i=0;i<NP;i++) {
-        double x = P[i].x, y = P[i].y;
-        double bestd = 1e300; int bestk = 0;
-        for (int k=0;k<4;k++) {
-            double val = fabs(A[k]*x + B[k]*y + Cc[k]) / Nn[k];
-            if (val < bestd) { bestd = val; bestk = k; }
+    // A small helper lambda-like macro for one assign+fit round
+    for (int iter=0; iter<2; ++iter) {
+        int counts[4] = {0,0,0,0};
+        double sumx[4] = {0,0,0,0}, sumy[4] = {0,0,0,0};
+        double sumxx[4] = {0,0,0,0}, sumyy[4] = {0,0,0,0}, sumxy[4] = {0,0,0,0};
+        for (int i=0;i<NP;i++) {
+            double x = P[i].x, y = P[i].y;
+            double bestd = 1e300; int bestk = 0;
+            for (int k=0;k<4;k++) {
+                double val = fabs(A[k]*x + B[k]*y + Cc[k]) / (Nn[k] > 0.0 ? Nn[k] : 1.0);
+                if (val < bestd) { bestd = val; bestk = k; }
+            }
+            counts[bestk]++;
+            sumx[bestk]+=x; sumy[bestk]+=y;
+            sumxx[bestk]+=x*x; sumyy[bestk]+=y*y; sumxy[bestk]+=x*y;
         }
-        counts[bestk]++;
-        sumx[bestk]+=x; sumy[bestk]+=y;
-        sumxx[bestk]+=x*x; sumyy[bestk]+=y*y; sumxy[bestk]+=x*y;
-    }
-
-    // Fit TLS for each group (fallback to initial if insufficient points)
-    for (int k=0;k<4;k++) {
-        if (counts[k] >= 2) {
-            double n = (double)counts[k];
-            double mx = sumx[k]/n, my = sumy[k]/n;
-            double cxx = sumxx[k]/n - mx*mx;
-            double cyy = sumyy[k]/n - my*my;
-            double cxy = sumxy[k]/n - mx*my;
-            // principal component angle
-            double theta = 0.5 * atan2(2.0*cxy, (cxx - cyy));
-            double ct = cos(theta), st = sin(theta);
-            // direction of max variance u = (ct, st); normal n = (-st, ct)
-            double a = -st, b = ct;
-            // In degenerate isotropic case, fall back to previous line
-            double norm = sqrt(a*a + b*b);
-            if (!(norm > 0.0 && isfinite(norm))) {
-                a = A[k]; b = B[k]; norm = Nn[k];
+        for (int k=0;k<4;k++) {
+            if (counts[k] >= 2) {
+                double n = (double)counts[k];
+                double mx = sumx[k]/n, my = sumy[k]/n;
+                double cxx = sumxx[k]/n - mx*mx;
+                double cyy = sumyy[k]/n - my*my;
+                double cxy = sumxy[k]/n - mx*my;
+                double theta = 0.5 * atan2(2.0*cxy, (cxx - cyy));
+                double ct = cos(theta), st = sin(theta);
+                double a = -st, b = ct;
+                double norm = sqrt(a*a + b*b);
+                if (!(norm > 0.0 && isfinite(norm))) {
+                    a = A[k]; b = B[k]; norm = sqrt(a*a + b*b);
+                    if (!(norm > 0.0)) norm = 1.0;
+                }
+                double c = -(a*mx + b*my);
+                if (!isfinite(a) || !isfinite(b) || !isfinite(c)) {
+                    a = A[k]; b = B[k]; c = Cc[k]; norm = sqrt(a*a + b*b);
+                    if (!(norm > 0.0)) norm = 1.0;
+                }
+                A[k]=a; B[k]=b; Cc[k]=c; Nn[k]=norm;
             }
-            double c = -(a*mx + b*my);
-            // Guard non-finite
-            if (!isfinite(a) || !isfinite(b) || !isfinite(c)) {
-                a = A[k]; b = B[k]; c = Cc[k]; norm = Nn[k];
-            }
-            A[k]=a; B[k]=b; Cc[k]=c; Nn[k]=norm;
         }
     }
 
