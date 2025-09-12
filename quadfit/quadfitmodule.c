@@ -1,4 +1,3 @@
-// quadfitmodule.c
 #define NPY_NO_DEPRECATED_API NPY_1_19_API_VERSION
 #include <Python.h>
 #include <math.h>
@@ -350,18 +349,18 @@ static PyMethodDef module_methods[] = {
 
 static struct PyModuleDef moduledef = {
     PyModuleDef_HEAD_INIT,
-    "quadfit",
+    "quadfitmodule",
     "Quadrilateral fitting helpers in C",
     -1,
     module_methods,
     NULL, NULL, NULL, NULL
 };
 
-PyMODINIT_FUNC PyInit_quadfit(void) {
+PyMODINIT_FUNC PyInit_quadfitmodule(void) {
     import_array();
 
     // set LineType fields (MSVC-friendly)
-    LineType.tp_name = "quadfit.Line";
+    LineType.tp_name = "quadfitmodule.Line";
     LineType.tp_basicsize = sizeof(LineObject);
     LineType.tp_flags = Py_TPFLAGS_DEFAULT;
     LineType.tp_doc = "2D Line Ax + By + C = 0";

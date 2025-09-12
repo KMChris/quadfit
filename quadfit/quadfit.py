@@ -8,9 +8,9 @@ from warnings import warn
 from itertools import combinations
 from random import sample
 
-from quadfit import Line as _Line  # C extension
-from quadfit import polygon_vertices_from_lines as _poly_from_lines  # C helper
-from quadfit import order_points_clockwise as _order_pts  # C helper
+from quadfitmodule import Line as _Line  # C extension
+from quadfitmodule import polygon_vertices_from_lines as _poly_from_lines  # C helper
+from quadfitmodule import order_points_clockwise as _order_pts  # C helper
 
 class QuadrilateralFitter:
     def __init__(self, polygon: np.ndarray | tuple | list | Polygon):
