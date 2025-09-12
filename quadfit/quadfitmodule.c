@@ -349,16 +349,12 @@ static PyObject* mod_simplify_polygon_dp(PyObject* self, PyObject* args, PyObjec
 static PyObject* mod_convex_hull_monotone(PyObject* self, PyObject* args, PyObject* kwargs);
 
 static PyMethodDef module_methods[] = {
-    {"order_points_clockwise", (PyCFunction)mod_order_points_clockwise, METH_VARARGS, "Order Nx2 points clockwise"},
-    {"polygon_vertices_from_lines", (PyCFunction)mod_polygon_vertices_from_lines, METH_VARARGS, "Intersect consecutive lines to polygon vertices (ordered)"},
-    // New high-level accelerated helpers
-    // best_iou_quadrilateral(points: array[N,2], max_combinations: int = 300, seed: int|None = None) -> tuple[(x,y), (x,y), (x,y), (x,y)]
-    // finetune_quadrilateral(points: array[M,2], initial_vertices: array[4,2]) -> (tuple[Line, ...4], tuple[(x,y), ...4])
-    // expand_quadrilateral(lines: tuple[Line, ...4], hull_points: array[K,2]) -> (tuple[Line, ...4], tuple[(x,y), ...4])
-    {"best_iou_quadrilateral", (PyCFunction)mod_best_iou_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Find quadrilateral (from hull vertices) with max IoU vs convex hull"},
-    {"finetune_quadrilateral", (PyCFunction)mod_finetune_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Assign points to nearest side, fit TLS lines, return lines and vertices"},
-    {"expand_quadrilateral", (PyCFunction)mod_expand_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Push lines outward to cover hull, return lines and vertices"},
-    {"simplify_polygon_dp", (PyCFunction)mod_simplify_polygon_dp, METH_VARARGS | METH_KEYWORDS, "Douglas–Peucker simplification for closed polygon with IoU threshold against original (convex)"},
+    {"order_points_clockwise", (PyCFunction)mod_order_points_clockwise, METH_VARARGS, "Order Nx2 points by angle around centroid (CCW)"},
+    {"polygon_vertices_from_lines", (PyCFunction)mod_polygon_vertices_from_lines, METH_VARARGS, "Intersect consecutive lines and return polygon vertices ordered counter-clockwise (CCW)"},
+    {"best_iou_quadrilateral", (PyCFunction)mod_best_iou_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Find a 4-vertex polygon (from hull vertices) with maximum IoU vs convex hull (returns CCW order)"},
+    {"finetune_quadrilateral", (PyCFunction)mod_finetune_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Assign points to nearest side, fit TLS lines, and return (lines, CCW vertices)"},
+    {"expand_quadrilateral", (PyCFunction)mod_expand_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Push lines outward to cover the hull; return updated (lines, CCW vertices)"},
+    {"simplify_polygon_dp", (PyCFunction)mod_simplify_polygon_dp, METH_VARARGS | METH_KEYWORDS, "Douglas–Peucker simplification for a closed polygon with IoU constraint vs the original (convex) polygon"},
     {"convex_hull_monotone", (PyCFunction)mod_convex_hull_monotone, METH_VARARGS | METH_KEYWORDS, "Compute convex hull (monotone chain). Returns closed ring (H+1,2) with last point equal to first."},
     {NULL, NULL, 0, NULL}
 };

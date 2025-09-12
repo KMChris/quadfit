@@ -2,6 +2,8 @@ from quadfit import QuadrilateralFitter
 import numpy as np
 import cv2
 from matplotlib import pyplot as plt
+import timeit
+from typing import Iterable, Tuple
 
 def yugioh_test():
     image = cv2.cvtColor(cv2.imread('./resources/input_sample.jpg'), cv2.COLOR_BGR2RGB)
@@ -16,14 +18,76 @@ def yugioh_test():
     noisy_corners[:, 0] = np.clip(noisy_corners[:, 0], a_min=0., a_max=image.shape[1])
     noisy_corners[:, 1] = np.clip(noisy_corners[:, 1], a_min=0., a_max=image.shape[0])
 
+    start = timeit.default_timer()
     fitter = QuadrilateralFitter(polygon=noisy_corners)
-    fitted_quadrilateral = fitter.fit(simplify_polygons_larger_than=30)
-    tight_quadrilateral = fitter.tight_quadrilateral
+    after_fitter = timeit.default_timer()
+    # If only the initial guess is needed, skip later stages for speed
+    result = fitter.fit(simplify_polygons_larger_than=30, until="initial")
+    after_fit = timeit.default_timer()
+    tight_quadrilateral = result
+    after_tight = timeit.default_timer()
 
+    print(f"QuadrilateralFitter init: {after_fitter - start:.6f} seconds")
+    print(f"fit() call: {after_fit - after_fitter:.6f} seconds")
+    print(f"tight_quadrilateral access: {after_tight - after_fit:.6f} seconds")
+    print(f"Total: {after_tight - start:.6f} seconds")
 
+def plot_fitter(fitter: QuadrilateralFitter):
+    """Plot the input points, convex hull, and any available quadrilaterals from the fitter."""
+    # Input polygon / points
+    pc = fitter._polygon_coords  # internal, but OK for debugging/demo
+    plt.plot(pc[:, 0], pc[:, 1], alpha=0.3, linestyle='-', marker='o', label='Input Polygon')
+
+    # Convex hull
+    hx, hy = fitter._hull_coords[:, 0], fitter._hull_coords[:, 1]
+    plt.fill(hx, hy, alpha=0.4, label='Convex Hull', color='orange')
+
+    # Initial quadrilateral if present
+    if fitter._initial_quadrilateral is not None:
+        ix, iy = zip(*fitter._initial_quadrilateral)
+        plt.plot(ix + (ix[0],), iy + (iy[0],), linestyle='--', alpha=0.5, color='green', label='Initial Guess')
+
+    # Final quadrilateral if present
+    if fitter._final_quadrilateral is not None:
+        x, y = zip(*fitter._final_quadrilateral)
+        plt.plot(x + (x[0],), y + (y[0],), label='Final Quadrilateral')
+        plt.scatter(x, y, marker='x', color='red')
+
+    plt.axis('equal')
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.title('Quadrilateral Fitting')
+    plt.legend()
+    ax = plt.gca()
+    ax.invert_yaxis()
+    plt.grid(True)
+    plt.show()
+
+def benchmark_case(name: str, data: np.ndarray, repeats: int = 3, simplify_polygons_larger_than: int = 30):
+    def time_once(until: str) -> Tuple[float, float, float]:
+        t0 = timeit.default_timer()
+        fitter = QuadrilateralFitter(polygon=data)
+        t1 = timeit.default_timer()
+        _ = fitter.fit(simplify_polygons_larger_than=simplify_polygons_larger_than, until=until)
+        t2 = timeit.default_timer()
+        return (t1 - t0, t2 - t1, t2 - t0)
+
+    results = {k: [] for k in ("initial", "refined", "final")}
+    for k in results.keys():
+        for _ in range(repeats):
+            results[k].append(time_once(k))
+
+    def avg(triples: Iterable[Tuple[float, float, float]]):
+        arr = np.array(triples, dtype=float)
+        return arr.mean(axis=0)
+
+    ai, ar, af = avg(results["initial"]), avg(results["refined"]), avg(results["final"])
+    print(f"\nBenchmark: {name} (N={len(data)})  repeats={repeats}")
+    print(f"  until=initial -> init: {ai[0]:.6f}s, fit: {ai[1]:.6f}s, total: {ai[2]:.6f}s")
+    print(f"  until=refined -> init: {ar[0]:.6f}s, fit: {ar[1]:.6f}s, total: {ar[2]:.6f}s")
+    print(f"  until=final   -> init: {af[0]:.6f}s, fit: {af[1]:.6f}s, total: {af[2]:.6f}s")
 
 if __name__ == '__main__':
-
     # 1. Deformed trapezoid
     num_points = 20
     left_side = np.linspace([0.2, 0.3], [0.25, 0.8], num_points) + np.random.normal(scale=0.01, size=(num_points, 2))
@@ -60,10 +124,20 @@ if __name__ == '__main__':
     bottom_side = np.linspace([0.75, 0.2], [0.2, 0.2], num_points) + np.random.normal(scale=0.01, size=(num_points, 2))
     almost_triangle_trapezoid = np.vstack([top_side, right_side, bottom_side, left_side])
 
-    # Running the tests
-    test_data = [deformed_trapezoid, square, deformed_circle, almost_triangle_trapezoid]
+    # Running the tests (benchmark + plots)
+    test_data = [
+        ("deformed_trapezoid", deformed_trapezoid),
+        ("square", square),
+        ("deformed_circle", deformed_circle),
+        ("almost_triangle_trapezoid", almost_triangle_trapezoid),
+    ]
 
-    for data in test_data:
-        fitter = QuadrilateralFitter(polygon=data)
-        fitter.fit()
-        fitter.plot()
+    # Benchmarks: compare until=initial/refined/final timings
+    for name, data in test_data:
+        benchmark_case(name, np.asarray(data, dtype=float), repeats=3)
+
+    for _, data in test_data:
+        fitter = QuadrilateralFitter(polygon=np.asarray(data, dtype=float))
+        # Full pipeline
+    quad = fitter.fit()
+    plot_fitter(fitter)

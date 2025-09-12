@@ -24,21 +24,22 @@ The simplest way to use **QuadrilateralFitter** is just one line:
 ```python
 from quadfit import QuadrilateralFitter
 
-# Fit an input polygon of N sides
-fitted_quadrilateral = QuadrilateralFitter(polygon=your_noisy_polygon).fit()
+# Fit an input polygon of N sides and get the final quadrilateral directly
+quad = QuadrilateralFitter(polygon=your_noisy_polygon).fit()
 ```
 
 Optionally, you can trade a bit of accuracy for speed and determinism using the additional arguments of `fit`:
 
 ```python
-# Limit the number of initial combinations and fix RNG seed for reproducibility
-fitted_quadrilateral = QuadrilateralFitter(your_noisy_polygon).fit(
+# Limit the number of initial combinations and fix RNG seed; choose stage with 'until'
+quad = QuadrilateralFitter(your_noisy_polygon).fit(
   simplify_polygons_larger_than=30,
   start_simplification_epsilon=0.1,
   max_simplification_epsilon=0.5,
   simplification_epsilon_increment=0.02,
   max_initial_combinations=1000,
   random_seed=123,
+  until="final",  # or "initial" / "refined"
 )
 ```
 
@@ -48,10 +49,10 @@ fitted_quadrilateral = QuadrilateralFitter(your_noisy_polygon).fit(
   <img alt="Fitting Example 2" title="Fitting Example 2" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/basic_example_2.png" height="250px">&nbsp;
 </div>
 
-If your application can accept a quadrilateral that does not strictly include all input points, you can get the tighter quadrilateral (the "Initial Guess") with:
+If your application can accept a quadrilateral that does not strictly include all input points, use the tighter initial guess with early stop:
 
 ```python
-fitted_quadrilateral = QuadrilateralFitter(polygon=your_noisy_polygon).tight_quadrilateral
+initial = QuadrilateralFitter(polygon=your_noisy_polygon).fit(until="initial")
 ```
 
 ## API Reference
@@ -62,21 +63,32 @@ Initialize the **QuadrilateralFitter** instance.
 
 - `polygon`: **np.ndarray | tuple | list | object**. Coordinates of the input geometry. Preferred: `np.ndarray` of shape (N, 2) or list/tuple of `(x, y)`. Also accepts objects exposing `.exterior.coords` or `.coords` (e.g., Shapely geometries) via duck‑typing. Shapely is NOT required at runtime.
 
-### QuadrilateralFitter.fit(
-  simplify_polygons_larger_than: int | None = 10,
-  start_simplification_epsilon: float = 0.1,
-  max_simplification_epsilon: float = 0.5,
-  simplification_epsilon_increment: float = 0.02,
-  max_initial_combinations: int = 300,
-  random_seed: int | None = None
-)
+### QuadrilateralFitter.fit → tuple of 4 (x, y)
+
+Signature:
+
+```python
+QuadrilateralFitter.fit(
+    simplify_polygons_larger_than: int | None = 10,
+    start_simplification_epsilon: float = 0.1,
+    max_simplification_epsilon: float = 0.5,
+    simplification_epsilon_increment: float = 0.02,
+    max_initial_combinations: int = 300,
+  random_seed: int | None = None,
+  until: Literal["initial", "refined", "final"] = "final",
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]
+```
 
 - `simplify_polygons_larger_than`: If specified, performs a preliminary Douglas–Peucker simplification of the convex hull when it has more than this many vertices. This speeds up the process but may lead to a slightly sub‑optimal quadrilateral. Default: 10.
 - `start_simplification_epsilon`, `max_simplification_epsilon`, `simplification_epsilon_increment`: Epsilon schedule for the Douglas–Peucker simplification.
 - `max_initial_combinations`: Limits the number of candidate quadrilaterals tested when searching the initial guess. If 0 or larger than the total number of combinations C(N,4), a full search is performed. Otherwise, up to this many unique combinations are sampled randomly. Default: 300.
 - `random_seed`: RNG seed for deterministic sampling when `max_initial_combinations` is used. Default: None.
+- `until`: Choose how far the pipeline should run for performance. `"initial"` returns only the initial guess, skipping finetune/expansion. `"refined"` runs TLS finetuning but skips final expansion. `"final"` runs the full pipeline. Default: `"final"`.
 
-**Returns**: **tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]**: Four `XY` coordinates (clockwise) of the fitted quadrilateral. This quadrilateral minimizes the **IoU** (Intersection over Union) with the input polygon while containing its convex hull. If your use case can allow losing some points from the input polygon, use the `QuadrilateralFitter.tight_quadrilateral` property to obtain a tighter quadrilateral.
+**Returns**: A 4-vertex quadrilateral (clockwise) for the requested stage:
+- `until="initial"`: best IoU vs convex hull (may not contain all points)
+- `until="refined"`: after TLS finetuning
+- `until="final"`: expanded to strictly contain the convex hull (default)
 
 
 ## Real Case Example
@@ -110,17 +122,11 @@ And now, let's run **QuadrilateralFitter** to find the quadrilateral that best a
 ```python
 from quadfit import QuadrilateralFitter
 
-# Define the fitter (we want to keep it for reading internal variables later)
+# Define the fitter and compute desired stages
 fitter = QuadrilateralFitter(polygon=noisy_corners)
-
-# Get the fitted quadrilateral that contains all the points inside the input polygon
-fitted_quadrilateral = np.array(fitter.fit(), dtype=np.float32)
-# If you wanna to get a tighter mask, less likely to contain points outside the real quadrilateral, 
-# but that cannot ensure to always contain all the points within the input polygon, you can use:
-tight_quadrilateral = np.array(fitter.tight_quadrilateral, dtype=np.float32)
-
-# To show the plot of the fitting process
-fitter.plot()
+fitted_quadrilateral = np.array(fitter.fit(until="final"), dtype=np.float32)
+# Tighter quadrilateral (may exclude some points):
+tight_quadrilateral = np.array(fitter.fit(until="initial"), dtype=np.float32)
 ```
 
 <div align="center">
