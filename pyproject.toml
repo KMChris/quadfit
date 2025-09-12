@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "numpy>=1.19"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quadfit"
+version = "1.0.0"
+authors = [
+  {name = "Krzysztof Mizgała", email = "krzysztof@mizgala.pl"},
+]
+description ="Fork of QuadrilateralFitter rewritten in C. QuadrilateralFitter is an efficient and easy-to-use Python library for fitting irregular quadrilaterals from irregular polygons or any noisy data."
+requires-python = ">=3.9"
+readme = {file = "README.md", content-type = "text/markdown"}
+license = "MIT"
+license-files = ["LICENSE*"]
+keywords= ["quadrilateral", "fitter", "polygon", "shape analysis", "geometry"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: C",
+  "Operating System :: OS Independent",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Education",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = ["shapely", "numpy", "scipy"]
+
+[project.urls]
+Homepage = "https://github.com/KMChris/quadfit"

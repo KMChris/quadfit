@@ -3,7 +3,7 @@ This project is a fork of the original [QuadrilateralFitter](https://github.com/
 Modifications by Krzysztof Mizgała (2025). Licensed under the MIT License.
 The original Python code has been rewritten in C to boost performance.
 
-<img alt="QuadrilateralFitter Logo" title="QuadrilateralFitter" src="https://raw.githubusercontent.com/Eric-Canas/quadrilateral-fitter/main/resources/logo.png" width="20%" align="left"> **QuadrilateralFitter** is an efficient and easy-to-use library for fitting irregular quadrilaterals from polygons or point clouds.
+<img alt="QuadrilateralFitter Logo" title="QuadrilateralFitter" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/logo.png" width="20%" align="left"> **QuadrilateralFitter** is an efficient and easy-to-use library for fitting irregular quadrilaterals from polygons or point clouds.
 
 **QuadrilateralFitter** helps you find that four corners polygon that **best approximates** your noisy data or detection, so you can apply further processing steps like: _perspective correction_ or _pattern matching_, without worrying about noise or non-expected vertex.
 
@@ -14,7 +14,7 @@ Optimal **Fitted Quadrilateral** is the smallest area quadrilateral that contain
 You can install **QuadrilateralFitter** with pip:
 
 ```bash
-pip install quadrilateral-fitter
+pip install quadfit
 ```
 
 ## Usage
@@ -29,9 +29,9 @@ fitted_quadrilateral = QuadrilateralFitter(polygon=your_noisy_polygon).fit()
 ```
 
 <div align="center">
-  <img alt="Fitting Example 1" title="Fitting Example 1" src="https://raw.githubusercontent.com/Eric-Canas/quadrilateral-fitter/main/resources/basic_example_1.png" height="250px">
+  <img alt="Fitting Example 1" title="Fitting Example 1" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/basic_example_1.png" height="250px">
          &nbsp;
-  <img alt="Fitting Example 2" title="Fitting Example 2" src="https://raw.githubusercontent.com/Eric-Canas/quadrilateral-fitter/main/resources/basic_example_2.png" height="250px">&nbsp;
+  <img alt="Fitting Example 2" title="Fitting Example 2" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/basic_example_2.png" height="250px">&nbsp;
 </div>
 
 If your application can accept fitted quadrilateral to don't strictly include all points within input polygon, you can get the tighter quadrilateral shown as `Initial Guess` with:
@@ -77,7 +77,7 @@ noisy_corners[:, 0] = np.clip(noisy_corners[:, 0], a_min=0., a_max=image.shape[1
 noisy_corners[:, 1] = np.clip(noisy_corners[:, 1], a_min=0., a_max=image.shape[0])
 ```
 <div align="center">
-<img alt="Input Sample" title="Input Sample" src="https://raw.githubusercontent.com/Eric-Canas/quadrilateral-fitter/main/resources/input_noisy_detection.png" height="300px" align="center">
+<img alt="Input Sample" title="Input Sample" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/input_noisy_detection.png" height="300px" align="center">
 </div>
 
 And now, let's run **QuadrilateralFitter** to find the quadrilateral that best approximates our noisy detection (without leaving points outside).
@@ -99,9 +99,9 @@ fitter.plot()
 ```
 
 <div align="center">
-  <img alt="Fitting Process" title="Fitting Process" src="https://raw.githubusercontent.com/Eric-Canas/quadrilateral-fitter/main/resources/fitting_process.png" height="300px">
+  <img alt="Fitting Process" title="Fitting Process" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/fitting_process.png" height="300px">
          &nbsp; &nbsp;
-  <img alt="Fitted Quadrilateral" title="Fitted Quadrilateral" src="https://raw.githubusercontent.com/Eric-Canas/quadrilateral-fitter/main/resources/fitted_quadrilateral.png" height="300px">&nbsp;
+  <img alt="Fitted Quadrilateral" title="Fitted Quadrilateral" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/fitted_quadrilateral.png" height="300px">&nbsp;
 </div>
 
 Finally, for use cases like this, we could use fitted quadrilaterals to apply a perspective correction to the image, so we can get a visual insight of the results.
@@ -129,7 +129,7 @@ for quadrilateral in (fitted_quadrilateral, tight_quadrilateral):
 ```
 
 <div align="center">
-  <img alt="Input Segmentation" title="Input Segmentation" src="https://raw.githubusercontent.com/Eric-Canas/quadrilateral-fitter/main/resources/input_segmentation.png" height="230px">
-  <img alt="Corrected Perspective Fitted" title="Corrected Perspective Fitted" src="https://raw.githubusercontent.com/Eric-Canas/quadrilateral-fitter/main/resources/corrected_perspective_fitted.png" height="230px">
-  <img alt="Corrected Perspective Tight" title="Corrected Perspective Tight" src="https://raw.githubusercontent.com/Eric-Canas/quadrilateral-fitter/main/resources/corrected_perspective_tight.png" height="230px">
+  <img alt="Input Segmentation" title="Input Segmentation" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/input_segmentation.png" height="230px">
+  <img alt="Corrected Perspective Fitted" title="Corrected Perspective Fitted" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/corrected_perspective_fitted.png" height="230px">
+  <img alt="Corrected Perspective Tight" title="Corrected Perspective Tight" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/corrected_perspective_tight.png" height="230px">
 </div>
