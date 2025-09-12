@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from shapely import GeometryCollection
 from shapely.geometry import Polygon, LineString
 import numpy as np
 from warnings import warn
 
-from quadfitmodule import Line as _Line  # C extension
 from quadfitmodule import best_iou_quadrilateral as _best_iou_quad  # C accelerated
 from quadfitmodule import finetune_quadrilateral as _finetune_quad  # C accelerated
 from quadfitmodule import expand_quadrilateral as _expand_quad  # C accelerated
@@ -22,19 +20,19 @@ class QuadrilateralFitter:
         
         if isinstance(polygon, Polygon):
             _polygon = polygon
-            self._polygon_coords = np.array(polygon.exterior.coords, dtype=np.float32)
+            self._polygon_coords = np.array(polygon.exterior.coords, dtype=np.float64)
         else:
             if type(polygon) == np.ndarray:
                 assert polygon.shape[1] == len(
                     polygon.shape) == 2, f"Input polygon must have shape (N, 2). Got {polygon.shape}"
                 _polygon = Polygon(polygon)
-                self._polygon_coords = polygon
+                self._polygon_coords = np.asarray(polygon, dtype=np.float64)
             elif isinstance(polygon, (list, tuple)):
                 # Checking if the list or tuple has sub-lists/tuples of length 2 (i.e., coordinates)
                 assert all(isinstance(coord, (list, tuple)) and len(coord) == 2 for coord in
                            polygon), "Expected sub-lists or sub-tuples of length 2 for coordinates"
                 _polygon = Polygon(polygon)
-                self._polygon_coords = np.array(polygon, dtype=np.float32)
+                self._polygon_coords = np.array(polygon, dtype=np.float64)
             else:
                 raise TypeError(f"Unexpected input type: {type(polygon)}. Accepted are np.ndarray, tuple, "
                                 f"list and shapely.Polygon")
@@ -61,9 +59,12 @@ class QuadrilateralFitter:
                 _polygon = Polygon(false_coords)
                 assert isinstance(_polygon, Polygon), "Expected a Polygon object from the input coordinates"
 
-                self._polygon_coords = np.array(_polygon.exterior.coords, dtype=np.float32)
+        # Ensure coords reflect the possibly adjusted polygon (e.g., LineString fallback)
+        self._polygon_coords = np.array(_polygon.exterior.coords, dtype=np.float64)
 
         self.convex_hull_polygon = _polygon.convex_hull
+        # Cache convex hull coordinates as numpy (float64) for downstream C routines
+        self._hull_coords = np.array(self.convex_hull_polygon.exterior.coords, dtype=np.float64)
 
         self._initial_guess = None
 
@@ -73,7 +74,8 @@ class QuadrilateralFitter:
         self.expanded_quadrilateral = None
 
     def fit(self, simplify_polygons_larger_than: int|None = 10, start_simplification_epsilon: float = 0.1,
-            max_simplification_epsilon: float = 0.5, simplification_epsilon_increment: float = 0.02) -> \
+        max_simplification_epsilon: float = 0.5, simplification_epsilon_increment: float = 0.02,
+        max_initial_combinations: int = 300, random_seed: int | None = None) -> \
             tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]:
         """
         Fits an irregular quadrilateral around the input polygon. The quadrilateral is optimized to minimize
@@ -94,18 +96,27 @@ class QuadrilateralFitter:
                         simplify_polygons_larger_than is not None (for Douglas-Peucker simplification).
         :param max_simplification_epsilon: float. The maximum simplification epsilon to use if
                         simplify_polygons_larger_than is not None (for Douglas-Peucker simplification).
-        :param simplification_epsilon_increment: float. The increment in the simplification epsilon to use if
+    :param simplification_epsilon_increment: float. The increment in the simplification epsilon to use if
                         simplify_polygons_larger_than is not None (for Douglas-Peucker simplification).
+    :param max_initial_combinations: int. Limit na liczbę kombinacji kandydatów (C(N,4)) do sprawdzenia
+            przy wyborze wstępnego czworokąta. Gdy 0 lub wartość >= C(N,4), wykonywane jest pełne
+            przeszukanie; w przeciwnym razie losowo próbkowane jest max_initial_combinations unikatowych
+            kombinacji.
+    :param random_seed: int | None. Ziarno RNG dla losowego próbkowania kombinacji (deterministyczność wyników).
 
         :return: A tuple containing four tuples, each of which has two float elements representing the (x, y)
                 coordinates of the quadrilateral's vertices. The vertices are order clockwise.
 
         :raises AssertionError: If the input polygon does not have a shape of (N, 2).
         """
-        self._initial_guess = self.__find_initial_quadrilateral(max_sides_to_simplify=simplify_polygons_larger_than,
-                                                            start_simplification_epsilon=start_simplification_epsilon,
-                                                            max_simplification_epsilon=max_simplification_epsilon,
-                                                            simplification_epsilon_increment=simplification_epsilon_increment)
+        self._initial_guess = self.__find_initial_quadrilateral(
+            max_sides_to_simplify=simplify_polygons_larger_than,
+            start_simplification_epsilon=start_simplification_epsilon,
+            max_simplification_epsilon=max_simplification_epsilon,
+            simplification_epsilon_increment=simplification_epsilon_increment,
+            max_combinations=max_initial_combinations,
+            random_seed=random_seed,
+        )
         self.fitted_quadrilateral = self.__finetune_guess()
         self.expanded_quadrilateral = self.__expand_quadrilateral()
         return self.fitted_quadrilateral
@@ -115,7 +126,8 @@ class QuadrilateralFitter:
                                      start_simplification_epsilon: float = 0.1,
                                      max_simplification_epsilon: float = 0.5,
                                      simplification_epsilon_increment: float = 0.02,
-                                     max_combinations: int = 300) -> Polygon:
+                                     max_combinations: int = 300,
+                                     random_seed: int | None = None) -> Polygon:
         """
         Internal method to find the initial approximating quadrilateral based on the vertices of the Convex Hull.
         To find the initial quadrilateral, we iterate through all 4-vertex combinations of the Convex Hull vertices
@@ -132,27 +144,29 @@ class QuadrilateralFitter:
         :param simplification_epsilon_increment: float. The increment in the simplification epsilon to use if
                         max_sides_to_simplify is not None (for Douglas-Peucker simplification).
 
-        :param max_combinations: int. The maximum number of combinations to try. If the number of combinations
-                        is larger than this number, the method will only run random max_combinations combinations.
+    :param max_combinations: int. The maximum number of combinations to try. If the number of combinations
+            is larger than this number, the method will only run random max_combinations combinations.
+    :param random_seed: int | None. RNG seed for deterministic random sampling when max_combinations < C(N,4).
 
         :return: Polygon. A Shapely Polygon object representing the initial quadrilateral approximation.
         """
-        # Simplify the Convex Hull optionally (C), then let C do the max-IoU selection among hull vertices
+        # Przygotuj wierzchołki otoczki wypukłej (opcjonalnie uproszczone) jako tablicę numpy.
         if max_sides_to_simplify is None:
-            simplified_polygon = self.convex_hull_polygon
+            hull_coords = self._hull_coords
         else:
-            hull_coords = np.array(self.convex_hull_polygon.exterior.coords, dtype=np.float64)
-            simp = _simplify_dp(hull_coords,
-                                max_sides_to_simplify,
-                                start_simplification_epsilon,
-                                max_simplification_epsilon,
-                                simplification_epsilon_increment,
-                                0.8)
-            simplified_polygon = Polygon(np.asarray(simp))
+            hull_coords = self._hull_coords
+            simp = _simplify_dp(
+                hull_coords,
+                max_sides_to_simplify,
+                start_simplification_epsilon,
+                max_simplification_epsilon,
+                simplification_epsilon_increment,
+                0.8,
+            )
+            hull_coords = np.asarray(simp, dtype=np.float64)
 
-        hull_coords = np.array(simplified_polygon.exterior.coords, dtype=np.float64)
-        # C returns 4 vertices; we wrap them as a Shapely Polygon
-        quad_vertices = _best_iou_quad(hull_coords, max_combinations)
+        # C zwraca 4 wierzchołki; opakowujemy w Shapely Polygon dla spójności wewnętrznej
+        quad_vertices = _best_iou_quad(hull_coords, max_combinations, random_seed)
         best_quadrilateral = Polygon(quad_vertices)
         return best_quadrilateral
 
@@ -189,7 +203,7 @@ class QuadrilateralFitter:
         :return: Polygon. A Shapely Polygon object representing the expanded quadrilateral.
         """
         # Delegate to accelerated C expansion using hull points
-        hull_coords = np.array(self.convex_hull_polygon.exterior.coords, dtype=np.float64)
+        hull_coords = self._hull_coords
         lines_obj, vertices = _expand_quad(self._line_equations, hull_coords)
         self._expanded_line_equations = tuple(lines_obj)
         quad = tuple(map(tuple, vertices))
@@ -221,14 +235,7 @@ class QuadrilateralFitter:
         # Return the IoU value
         return (intersection / union) if union != 0. else 0.
 
-    @staticmethod
-    def __sign(x: int | float) -> int:
-        """
-        Return the sign of a number.
-        :param x: float. The number to check.
-        :return: int. 1 if x > 0, -1 if x < 0, 0 if x == 0.
-        """
-        return 1 if x > 0 else (-1 if x < 0 else 0)
+    # (usunięto nieużywaną metodę __sign)
 
     def plot(self):
         """

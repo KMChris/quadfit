@@ -19,7 +19,7 @@ pip install quadfit
 
 ## Usage
 
-There is only one line you need to use **QuadrilateralFitter**:
+The simplest way to use **QuadrilateralFitter** is just one line:
 
 ```python
 from quadfit import QuadrilateralFitter
@@ -28,13 +28,27 @@ from quadfit import QuadrilateralFitter
 fitted_quadrilateral = QuadrilateralFitter(polygon=your_noisy_polygon).fit()
 ```
 
+Optionally, you can trade a bit of accuracy for speed and determinism using the additional arguments of `fit`:
+
+```python
+# Limit the number of initial combinations and fix RNG seed for reproducibility
+fitted_quadrilateral = QuadrilateralFitter(your_noisy_polygon).fit(
+  simplify_polygons_larger_than=30,
+  start_simplification_epsilon=0.1,
+  max_simplification_epsilon=0.5,
+  simplification_epsilon_increment=0.02,
+  max_initial_combinations=1000,
+  random_seed=123,
+)
+```
+
 <div align="center">
   <img alt="Fitting Example 1" title="Fitting Example 1" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/basic_example_1.png" height="250px">
          &nbsp;
   <img alt="Fitting Example 2" title="Fitting Example 2" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/basic_example_2.png" height="250px">&nbsp;
 </div>
 
-If your application can accept fitted quadrilateral to don't strictly include all points within input polygon, you can get the tighter quadrilateral shown as `Initial Guess` with:
+If your application can accept a quadrilateral that does not strictly include all input points, you can get the tighter quadrilateral (the "Initial Guess") with:
 
 ```python
 fitted_quadrilateral = QuadrilateralFitter(polygon=your_noisy_polygon).tight_quadrilateral
@@ -44,14 +58,25 @@ fitted_quadrilateral = QuadrilateralFitter(polygon=your_noisy_polygon).tight_qua
 
 ### QuadrilateralFitter(polygon)
 
-Initialize the **QuadrilateralFitter** instance..
+Initialize the **QuadrilateralFitter** instance.
 
 - `polygon`: **np.ndarray | tuple | list | shapely.Polygon**. List of the polygon coordinates. It must be a list of coordinates, in the format `XY`, shape (N, 2).
 
-### QuadrilateralFitter.fit(simplify_polygons_larger_than = 10):
-- `simplify_polygons_larger_than`: **int | None**. List of the polygon coordinates. It must be a list of coordinates, in the format `XY`, shape (N, 2). If a number is specified, the method will make a preliminar _Douglas-Peucker_ simplification of the internally used _Convex Hull_ if it has more than `simplify_polygons_larger_than vertices`. This will speed up the process, but may lead to a sub-optimal quadrilateral approximation. Default: 10.
+### QuadrilateralFitter.fit(
+  simplify_polygons_larger_than: int | None = 10,
+  start_simplification_epsilon: float = 0.1,
+  max_simplification_epsilon: float = 0.5,
+  simplification_epsilon_increment: float = 0.02,
+  max_initial_combinations: int = 300,
+  random_seed: int | None = None
+)
 
-**Returns**: **tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]**: A `tuple` containing the four `XY` coordinates of the fitted cuadrilateral. This quadrilateral will minimize the **IoU** (Intersection Over Union) with the input _polygon_, while containing all its points inside. If your use case can allow loosing points from the input polygon, you can read the `QuadrilateralFitter.tight_polygon` property to obtain a tighter quadrilateral.
+- `simplify_polygons_larger_than`: If specified, performs a preliminary Douglas–Peucker simplification of the convex hull when it has more than this many vertices. This speeds up the process but may lead to a slightly sub‑optimal quadrilateral. Default: 10.
+- `start_simplification_epsilon`, `max_simplification_epsilon`, `simplification_epsilon_increment`: Epsilon schedule for the Douglas–Peucker simplification.
+- `max_initial_combinations`: Limits the number of candidate quadrilaterals tested when searching the initial guess. If 0 or larger than the total number of combinations C(N,4), a full search is performed. Otherwise, up to this many unique combinations are sampled randomly. Default: 300.
+- `random_seed`: RNG seed for deterministic sampling when `max_initial_combinations` is used. Default: None.
+
+**Returns**: **tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]**: Four `XY` coordinates (clockwise) of the fitted quadrilateral. This quadrilateral minimizes the **IoU** (Intersection over Union) with the input polygon while containing its convex hull. If your use case can allow losing some points from the input polygon, use the `QuadrilateralFitter.tight_quadrilateral` property to obtain a tighter quadrilateral.
 
 
 ## Real Case Example
@@ -107,7 +132,7 @@ fitter.plot()
 Finally, for use cases like this, we could use fitted quadrilaterals to apply a perspective correction to the image, so we can get a visual insight of the results.
 
 ```python
-# Generate the destiny points for the perspective correction by adjusting it to a perfect rectangle
+# Generate the destination points for the perspective correction by adjusting it to a perfect rectangle
 h, w = image.shape[:2]
 
 for quadrilateral in (fitted_quadrilateral, tight_quadrilateral):
@@ -118,12 +143,12 @@ for quadrilateral in (fitted_quadrilateral, tight_quadrilateral):
     min_x, min_y = np.min(quadrilateral, axis=0)
     max_x, max_y = np.max(quadrilateral, axis=0)
 
-    # Define the destiny points for the perspective correction
-    destiny_points = np.array(((min_x, min_y), (max_x, min_y),
-                               (max_x, max_y), (min_x, max_y)), dtype=np.float32)
+  # Define the destination points for the perspective correction
+  destination_points = np.array(((min_x, min_y), (max_x, min_y),
+                   (max_x, max_y), (min_x, max_y)), dtype=np.float32)
 
     # Calculate the homography matrix from the quadrilateral to the rectangle
-    homography_matrix, _ = cv2.findHomography(srcPoints=quadrilateral, dstPoints=rect_points)
+  homography_matrix, _ = cv2.findHomography(srcPoints=quadrilateral, dstPoints=destination_points)
     # Warp the image using the homography matrix
     warped_image = cv2.warpPerspective(src=image, M=homography_matrix, dsize=(w, h))
 ```
