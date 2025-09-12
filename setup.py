@@ -1,11 +1,27 @@
-from setuptools import setup, find_packages
+from setuptools import setup, Extension, find_packages
+import numpy as np
+import sys
+
+extra_compile_args = []
+if sys.platform == "win32":
+    extra_compile_args = ["/O2"]
+else:
+    extra_compile_args = ["-O3", "-std=c99", "-Wall"]
+
+ext = Extension(
+    "quadfit",
+    sources=["quadrilateral_fitter/quadfitmodule.c"],
+    include_dirs=[np.get_include()],
+    extra_compile_args=extra_compile_args,
+)
 
 setup(
-    name='quadrilateral-fitter',
-    version='1.10',
-    author='Eric-Canas',
-    author_email='eric@ericcanas.com',
-    url='https://github.com/Eric-Canas/quadrilateral-fitter',
+    name='quadfit',
+    version='1.0.0',
+    ext_modules=[ext],
+    author='Krzysztof Mizgała',
+    author_email='krzysztof@mizgala.pl',
+    url='https://github.com/KMChris/quadfit',
     description='QuadrilateralFitter is an efficient and easy-to-use Python library for fitting irregular '
                 'quadrilaterals from irregular polygons or any noisy data.',
     long_description=open('README.md', 'r').read(),

@@ -1,4 +1,8 @@
 # QuadrilateralFitter
+This project is a fork of the original [QuadrilateralFitter](https://github.com/Eric-Canas/quadrilateral-fitter) project.
+Modifications by Krzysztof Mizgała (2025). Licensed under the MIT License.
+The original Python code has been rewritten in C to boost performance.
+
 <img alt="QuadrilateralFitter Logo" title="QuadrilateralFitter" src="https://raw.githubusercontent.com/Eric-Canas/quadrilateral-fitter/main/resources/logo.png" width="20%" align="left"> **QuadrilateralFitter** is an efficient and easy-to-use library for fitting irregular quadrilaterals from polygons or point clouds.
 
 **QuadrilateralFitter** helps you find that four corners polygon that **best approximates** your noisy data or detection, so you can apply further processing steps like: _perspective correction_ or _pattern matching_, without worrying about noise or non-expected vertex.

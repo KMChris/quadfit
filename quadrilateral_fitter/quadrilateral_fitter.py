@@ -8,7 +8,9 @@ from warnings import warn
 from itertools import combinations
 from random import sample
 
-from quadrilateral_fitter import _Line  # Assuming you'll also rename the module
+from quadfit import Line as _Line  # C extension
+from quadfit import polygon_vertices_from_lines as _poly_from_lines  # C helper
+from quadfit import order_points_clockwise as _order_pts  # C helper
 
 class QuadrilateralFitter:
     def __init__(self, polygon: np.ndarray | tuple | list | Polygon):
@@ -254,30 +256,26 @@ class QuadrilateralFitter:
         :param line_equations: tuple[_Line]. A tuple of _Line objects representing the sides of the polygon.
         :return: tuple[tuple[float, float], ...]. A tuple of tuples representing the vertices of the polygon.
         """
-        # Find the intersection between each line and its next one
-        points = tuple(line1.get_intersection(other_line=line_equations[(i + 1) % len(line_equations)])
-                     for i, line1 in enumerate(line_equations))
-        # Order points clockwise
-        points = self.__order_points_clockwise(pts=points)
-        return points
+        # Użyj C-helpera do przecięć, a następnie uporządkuj wierzchołki zgodnie z ruchem wskazówek zegara w C
+        pts = _poly_from_lines(line_equations)
+        arr = np.array(pts, dtype=np.float64)
+        ordered = _order_pts(arr)
+        return tuple(map(tuple, ordered))
 
     def __order_points_clockwise(self, pts: np.ndarray | tuple[tuple[float, float], ...]) -> tuple[tuple[float, float], ...]:
+        """
+        Internal method to order points clockwise.
 
+        :param pts: np.ndarray | tuple[tuple[float, float], ...]. The points to be ordered.
+        :return: tuple[tuple[float, float], ...]. The points ordered clockwise.
+        """
+        # Delegacja do implementacji C
         as_np = isinstance(pts, np.ndarray)
-        if not as_np:
-            pts = np.array(pts, dtype=np.float32)
-        # Calculate the center of the points
-        center = np.mean(pts, axis=0)
-
-        # Compute the angles from the center
-        angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
-
-        # Sort the points by the angles in ascending order
-        sorted_pts = pts[np.argsort(angles)]
-
-        if not as_np:
-            sorted_pts = tuple(tuple(pt) for pt in sorted_pts)
-        return sorted_pts
+        arr = pts if as_np else np.array(pts, dtype=np.float64)
+        ordered = _order_pts(arr)
+        if as_np:
+            return ordered
+        return tuple(map(tuple, ordered))
 
     @staticmethod
     def __polygon_vertices_to_line_equations(polygon: Polygon) -> tuple[_Line]:
