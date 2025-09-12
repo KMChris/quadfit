@@ -60,7 +60,7 @@ fitted_quadrilateral = QuadrilateralFitter(polygon=your_noisy_polygon).tight_qua
 
 Initialize the **QuadrilateralFitter** instance.
 
-- `polygon`: **np.ndarray | tuple | list | shapely.Polygon**. List of the polygon coordinates. It must be a list of coordinates, in the format `XY`, shape (N, 2).
+- `polygon`: **np.ndarray | tuple | list | object**. Coordinates of the input geometry. Preferred: `np.ndarray` of shape (N, 2) or list/tuple of `(x, y)`. Also accepts objects exposing `.exterior.coords` or `.coords` (e.g., Shapely geometries) via duck‑typing. Shapely is NOT required at runtime.
 
 ### QuadrilateralFitter.fit(
   simplify_polygons_larger_than: int | None = 10,

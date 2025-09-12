@@ -28,7 +28,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
   "Topic :: Scientific/Engineering :: Mathematics",
 ]
-dependencies = ["shapely", "numpy"]
+dependencies = ["numpy"]
 
 [project.urls]
 Homepage = "https://github.com/KMChris/quadfit"

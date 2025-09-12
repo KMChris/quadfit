@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-from shapely.geometry import Polygon, LineString
 import numpy as np
 from warnings import warn
 
@@ -8,63 +6,58 @@ from quadfitmodule import best_iou_quadrilateral as _best_iou_quad  # C accelera
 from quadfitmodule import finetune_quadrilateral as _finetune_quad  # C accelerated
 from quadfitmodule import expand_quadrilateral as _expand_quad  # C accelerated
 from quadfitmodule import simplify_polygon_dp as _simplify_dp  # C accelerated
+from quadfitmodule import convex_hull_monotone as _convex_hull  # C accelerated
 
 class QuadrilateralFitter:
-    def __init__(self, polygon: np.ndarray | tuple | list | Polygon):
+    def __init__(self, polygon: np.ndarray | tuple | list | object):
         """
         Constructor for initializing the QuadrilateralFitter object.
 
-        :param polygon: np.ndarray. A NumPy array of shape (N, 2) representing the input polygon,
-                              where N is the number of vertices.
+        :param polygon: Coordinates of the input geometry. Accepted forms:
+                         - numpy.ndarray of shape (N, 2)
+                         - list/tuple of (x, y) pairs
+                         - any object with .exterior.coords (e.g., shapely.geometry.Polygon)
+                         - any object with .coords (e.g., shapely.geometry.LineString)
         """
-        
-        if isinstance(polygon, Polygon):
-            _polygon = polygon
-            self._polygon_coords = np.array(polygon.exterior.coords, dtype=np.float64)
+        # Normalize input to numpy array of shape (N, 2)
+        coords: np.ndarray | None = None
+        # Duck-typing for shapely Polygon
+        if hasattr(polygon, "exterior") and hasattr(getattr(polygon, "exterior"), "coords"):
+            coords = np.array(polygon.exterior.coords, dtype=np.float64)
+        # Duck-typing for shapely LineString or similar
+        elif hasattr(polygon, "coords"):
+            line_coords = np.array(polygon.coords, dtype=np.float64)
+            warn("Input appears to be a LineString-like geometry. Results may be inaccurate; using a padded rectangle around it.")
+            # Define a rectangle around the line with a margin
+            min_x, min_y = np.min(line_coords, axis=0)
+            max_x, max_y = np.max(line_coords, axis=0)
+            margin = 10.0
+            coords = np.array([
+                [min_x - margin, min_y - margin],
+                [min_x - margin, max_y + margin],
+                [max_x + margin, max_y + margin],
+                [max_x + margin, min_y - margin],
+                [min_x - margin, min_y - margin],
+            ], dtype=np.float64)
+        elif isinstance(polygon, np.ndarray):
+            if polygon.ndim != 2 or polygon.shape[1] != 2:
+                raise AssertionError(f"Input polygon must have shape (N, 2). Got {polygon.shape}")
+            coords = np.asarray(polygon, dtype=np.float64)
+        elif isinstance(polygon, (list, tuple)):
+            # Expect iterable of (x, y)
+            if not all(isinstance(coord, (list, tuple)) and len(coord) == 2 for coord in polygon):
+                raise AssertionError("Expected list/tuple of (x, y) coordinate pairs")
+            coords = np.array(polygon, dtype=np.float64)
         else:
-            if type(polygon) == np.ndarray:
-                assert polygon.shape[1] == len(
-                    polygon.shape) == 2, f"Input polygon must have shape (N, 2). Got {polygon.shape}"
-                _polygon = Polygon(polygon)
-                self._polygon_coords = np.asarray(polygon, dtype=np.float64)
-            elif isinstance(polygon, (list, tuple)):
-                # Checking if the list or tuple has sub-lists/tuples of length 2 (i.e., coordinates)
-                assert all(isinstance(coord, (list, tuple)) and len(coord) == 2 for coord in
-                           polygon), "Expected sub-lists or sub-tuples of length 2 for coordinates"
-                _polygon = Polygon(polygon)
-                self._polygon_coords = np.array(polygon, dtype=np.float64)
-            else:
-                raise TypeError(f"Unexpected input type: {type(polygon)}. Accepted are np.ndarray, tuple, "
-                                f"list and shapely.Polygon")
+            raise TypeError(
+                f"Unexpected input type: {type(polygon)}. Accepted: np.ndarray, list/tuple of (x,y), "
+                f"or any object exposing .exterior.coords / .coords"
+            )
 
-            if isinstance(_polygon, LineString):
-                warn("Polygon coordinates casted to a LineString. Quadrilateral Fitting results may be inaccurate.")
-                # Extract the line coordinates
-                line_coords = np.array(_polygon.coords, dtype=np.float32)
+        self._polygon_coords = coords
 
-                # Well define a rectangle around it with a margin
-                min_x, min_y = np.min(line_coords, axis=0)
-                max_x, max_y = np.max(line_coords, axis=0)
-                margin = 10
-
-                # Define the new coordinates for the tight rectangle with margin
-                false_coords = [
-                    [min_x - margin, min_y - margin],
-                    [min_x - margin, max_y + margin],
-                    [max_x + margin, max_y + margin],
-                    [max_x + margin, min_y - margin],
-                    [min_x - margin, min_y - margin]
-                ]
-
-                _polygon = Polygon(false_coords)
-                assert isinstance(_polygon, Polygon), "Expected a Polygon object from the input coordinates"
-
-        # Ensure coords reflect the possibly adjusted polygon (e.g., LineString fallback)
-        self._polygon_coords = np.array(_polygon.exterior.coords, dtype=np.float64)
-
-        self.convex_hull_polygon = _polygon.convex_hull
-        # Cache convex hull coordinates as numpy (float64) for downstream C routines
-        self._hull_coords = np.array(self.convex_hull_polygon.exterior.coords, dtype=np.float64)
+        # Compute convex hull once in C for hot-path
+        self._hull_coords = _convex_hull(self._polygon_coords)
 
         self._initial_guess = None
 
@@ -127,7 +120,7 @@ class QuadrilateralFitter:
                                      max_simplification_epsilon: float = 0.5,
                                      simplification_epsilon_increment: float = 0.02,
                                      max_combinations: int = 300,
-                                     random_seed: int | None = None) -> Polygon:
+                                     random_seed: int | None = None) -> tuple:
         """
         Internal method to find the initial approximating quadrilateral based on the vertices of the Convex Hull.
         To find the initial quadrilateral, we iterate through all 4-vertex combinations of the Convex Hull vertices
@@ -144,11 +137,11 @@ class QuadrilateralFitter:
         :param simplification_epsilon_increment: float. The increment in the simplification epsilon to use if
                         max_sides_to_simplify is not None (for Douglas-Peucker simplification).
 
-    :param max_combinations: int. The maximum number of combinations to try. If the number of combinations
-            is larger than this number, the method will only run random max_combinations combinations.
-    :param random_seed: int | None. RNG seed for deterministic random sampling when max_combinations < C(N,4).
+        :param max_combinations: int. The maximum number of combinations to try. If the number of combinations
+                is larger than this number, the method will only run random max_combinations combinations.
+        :param random_seed: int | None. RNG seed for deterministic random sampling when max_combinations < C(N,4).
 
-        :return: Polygon. A Shapely Polygon object representing the initial quadrilateral approximation.
+        :return: tuple: Cztery wierzchołki (x, y) początkowego czworokąta.
         """
         # Przygotuj wierzchołki otoczki wypukłej (opcjonalnie uproszczone) jako tablicę numpy.
         if max_sides_to_simplify is None:
@@ -165,30 +158,29 @@ class QuadrilateralFitter:
             )
             hull_coords = np.asarray(simp, dtype=np.float64)
 
-        # C zwraca 4 wierzchołki; opakowujemy w Shapely Polygon dla spójności wewnętrznej
+        # C zwraca 4 wierzchołki (np.ndarray shape (4,2)); zwracamy jako tuple of tuples
         quad_vertices = _best_iou_quad(hull_coords, max_combinations, random_seed)
-        best_quadrilateral = Polygon(quad_vertices)
-        return best_quadrilateral
+        return tuple(map(tuple, quad_vertices))
 
-    def __finetune_guess(self) -> Polygon:
+    def __finetune_guess(self) -> tuple:
         """
         Internal method to finetune the initial quadrilateral approximation to adjust to the input polygon.
         The method works by deciding which point of the initial polygon belongs to which side of the input polygon
         and fitting a line to each side of the input polygon. The intersection points between the lines will
         be the vertices of the new quadrilateral.
 
-        :return: Polygon. A Shapely Polygon object representing the finetuned quadrilateral.
+    :return: tuple. Cztery wierzchołki (x, y) dopracowanego czworokąta.
         """
 
         # Use C accelerated finetuning: assign points to nearest side and fit TLS lines
         points = np.asarray(self._polygon_coords, dtype=np.float64)
-        initv = np.array(self._initial_guess.exterior.coords[:-1], dtype=np.float64)
+        initv = np.array(self._initial_guess, dtype=np.float64)
         lines_obj, new_vertices = _finetune_quad(points, initv)
         # Store lines as Line objects
         self._line_equations = tuple(lines_obj)
         return tuple(map(tuple, new_vertices))
 
-    def __expand_quadrilateral(self) -> Polygon:
+    def __expand_quadrilateral(self) -> tuple:
         """
         Internal method that expands the initial quadrilateral approximation to make sure it contains all the vertices
         of the input polygon Convex Hull.
@@ -198,9 +190,9 @@ class QuadrilateralFitter:
             2. Find the intersection points between the lines to calculate the vertices of the
                new expanded quadrilateral
 
-        :param quadrilateral: Polygon. A Shapely Polygon object representing the initial quadrilateral approximation.
+        :param quadrilateral: tuple. Cztery wierzchołki początkowego czworokąta.
 
-        :return: Polygon. A Shapely Polygon object representing the expanded quadrilateral.
+    :return: tuple. Cztery wierzchołki (x, y) rozszerzonego czworokąta.
         """
         # Delegate to accelerated C expansion using hull points
         hull_coords = self._hull_coords
@@ -218,22 +210,7 @@ class QuadrilateralFitter:
 
     # -------------------------------- HELPER METHODS -------------------------------- #
 
-    def __iou(self, polygon1: Polygon, polygon2: Polygon, precomputed_polygon_1_area: float | None = None) -> float:
-        """
-        Calculate the Intersection over Union (IoU) between two polygons.
-
-        :param polygon1: Polygon. The first polygon.
-        :param polygon2: Polygon. The second polygon.
-        :param precomputed_polygon_1_area: float|None. The area of the first polygon. If None, it will be computed.
-        :return: float. The IoU value.
-        """
-        if precomputed_polygon_1_area is None:
-            precomputed_polygon_1_area = polygon1.area
-        # Calculate the intersection and union areas
-        intersection = polygon1.intersection(polygon2).area
-        union = precomputed_polygon_1_area + polygon2.area - intersection
-        # Return the IoU value
-        return (intersection / union) if union != 0. else 0.
+    # Removed Shapely-based IoU to avoid hard dependency.
 
     # (usunięto nieużywaną metodę __sign)
 
@@ -250,25 +227,19 @@ class QuadrilateralFitter:
         # Plot the original polygon as a set of alpha 0.4 points
         plt.plot(self._polygon_coords[:, 0], self._polygon_coords[:, 1], alpha=0.3,  linestyle='-', marker='o', label='Input Polygon')
 
-        # Plot the convex hull as a filled polygon
-        x, y = self.convex_hull_polygon.exterior.xy
-        plt.fill(x, y, alpha=0.4, label='Convex Hull', color='orange')
+        # Plot the convex hull as a filled polygon using cached hull coords
+        hx, hy = self._hull_coords[:, 0], self._hull_coords[:, 1]
+        plt.fill(hx, hy, alpha=0.4, label='Convex Hull', color='orange')
 
         # Plot the initial quadrilateral if it exists as a semi-transparent dashed line
         if self._initial_guess is not None:
-            # Calculate the IoU between the Convex Hull and the best-fitting quadrilateral
-            iou = self.__iou(polygon1=self.convex_hull_polygon, polygon2=Polygon(self._initial_guess))
-            x, y = self._initial_guess.exterior.xy
-            plt.plot(x, y, linestyle='--', alpha=0.5, color='green', label=f'Initial Guess (IoU={iou:.3f})')
+            ix, iy = zip(*self._initial_guess)
+            plt.plot(ix + (ix[0],), iy + (iy[0],), linestyle='--', alpha=0.5, color='green', label='Initial Guess')
 
         # Plot the best quadrilateral if it exists
         if self.fitted_quadrilateral is not None:
-            # Calculate the IoU between the Convex Hull and the best-fitting quadrilateral
-            iou = self.__iou(polygon1=self.convex_hull_polygon, polygon2=Polygon(self.fitted_quadrilateral))
             x, y = zip(*self.fitted_quadrilateral)
-            plt.plot(x + (x[0],), y + (y[0],), label=f'Fitted Quadrilateral (IoU={iou:.3f})')
-
-            # Mark the corners of the best quadrilateral with 'X'
+            plt.plot(x + (x[0],), y + (y[0],), label='Fitted Quadrilateral')
             plt.scatter(x, y, marker='x', color='red')
 
         plt.axis('equal')

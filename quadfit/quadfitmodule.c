@@ -346,6 +346,7 @@ static PyObject* mod_best_iou_quadrilateral(PyObject* self, PyObject* args, PyOb
 static PyObject* mod_finetune_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs);
 static PyObject* mod_expand_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs);
 static PyObject* mod_simplify_polygon_dp(PyObject* self, PyObject* args, PyObject* kwargs);
+static PyObject* mod_convex_hull_monotone(PyObject* self, PyObject* args, PyObject* kwargs);
 
 static PyMethodDef module_methods[] = {
     {"order_points_clockwise", (PyCFunction)mod_order_points_clockwise, METH_VARARGS, "Order Nx2 points clockwise"},
@@ -358,6 +359,7 @@ static PyMethodDef module_methods[] = {
     {"finetune_quadrilateral", (PyCFunction)mod_finetune_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Assign points to nearest side, fit TLS lines, return lines and vertices"},
     {"expand_quadrilateral", (PyCFunction)mod_expand_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Push lines outward to cover hull, return lines and vertices"},
     {"simplify_polygon_dp", (PyCFunction)mod_simplify_polygon_dp, METH_VARARGS | METH_KEYWORDS, "Douglas–Peucker simplification for closed polygon with IoU threshold against original (convex)"},
+    {"convex_hull_monotone", (PyCFunction)mod_convex_hull_monotone, METH_VARARGS | METH_KEYWORDS, "Compute convex hull (monotone chain). Returns closed ring (H+1,2) with last point equal to first."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -1016,4 +1018,76 @@ static PyObject* mod_expand_quadrilateral(PyObject* self, PyObject* args, PyObje
     PyTuple_SET_ITEM(ret, 1, out_pts);
     Py_DECREF(fast); PyMem_Free(H);
     return ret;
+}
+
+// convex_hull_monotone(points) -> np.ndarray[H+1,2] (closed ring)
+typedef struct { double x, y; } Pt2;
+static int cmp_pt2(const void* a, const void* b) {
+    const Pt2* p = (const Pt2*)a; const Pt2* q = (const Pt2*)b;
+    if (p->x < q->x) return -1; if (p->x > q->x) return 1;
+    if (p->y < q->y) return -1; if (p->y > q->y) return 1;
+    return 0;
+}
+static double cross_o(Pt2 o, Pt2 a, Pt2 b) {
+    return (a.x - o.x)*(b.y - o.y) - (a.y - o.y)*(b.x - o.x);
+}
+static PyObject* mod_convex_hull_monotone(PyObject* self, PyObject* args, PyObject* kwargs) {
+    static char* kwlist[] = {"points", NULL};
+    PyObject* points_obj=NULL;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O:convex_hull_monotone", kwlist, &points_obj)) return NULL;
+    PyArrayObject* arr=NULL; int r=0, c=2;
+    if (ensure_double_2d(points_obj, &arr, &r, &c) < 0) return NULL;
+    Pt2* pts = (Pt2*)PyMem_Malloc(sizeof(Pt2)*(size_t)r);
+    if (!pts) { Py_DECREF(arr); PyErr_NoMemory(); return NULL; }
+    // Load points, drop last if duplicates first
+    double* p = (double*)PyArray_DATA(arr);
+    npy_intp s0 = PyArray_STRIDE(arr,0)/sizeof(double);
+    npy_intp s1 = PyArray_STRIDE(arr,1)/sizeof(double);
+    int n = r;
+    if (r>=2) {
+        double x0 = *(p + 0*s0 + 0*s1), y0 = *(p + 0*s0 + 1*s1);
+        double xl = *(p + (r-1)*s0 + 0*s1), yl = *(p + (r-1)*s0 + 1*s1);
+        if (x0==xl && y0==yl) n = r-1;
+    }
+    for (int i=0;i<n;i++) { pts[i].x = *(p + i*s0 + 0*s1); pts[i].y = *(p + i*s0 + 1*s1); }
+    Py_DECREF(arr);
+    if (n == 0) {
+        PyMem_Free(pts);
+        npy_intp dims[2] = {0,2};
+        return (PyObject*)PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+    }
+    // Sort and unique
+    qsort(pts, (size_t)n, sizeof(Pt2), cmp_pt2);
+    int m = 0; for (int i=1;i<n;i++) if (!(pts[i].x==pts[m].x && pts[i].y==pts[m].y)) pts[++m]=pts[i];
+    int uniq = m+1;
+    if (uniq == 1) {
+        npy_intp dims[2] = {2,2};
+        PyArrayObject* out = (PyArrayObject*)PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+        if (!out) { PyMem_Free(pts); return NULL; }
+        double* o=(double*)PyArray_DATA(out);
+        o[0]=pts[0].x; o[1]=pts[0].y; o[2]=pts[0].x; o[3]=pts[0].y;
+        PyMem_Free(pts); return (PyObject*)out;
+    }
+    // Build lower and upper
+    Pt2* H = (Pt2*)PyMem_Malloc(sizeof(Pt2)*(size_t)(2*uniq));
+    if (!H) { PyMem_Free(pts); PyErr_NoMemory(); return NULL; }
+    int k=0;
+    for (int i=0;i<uniq;i++) {
+        while (k>=2 && cross_o(H[k-2], H[k-1], pts[i]) <= 0.0) k--;
+        H[k++] = pts[i];
+    }
+    int t = k+1;
+    for (int i=uniq-2;i>=0;i--) {
+        while (k>=t && cross_o(H[k-2], H[k-1], pts[i]) <= 0.0) k--;
+        H[k++] = pts[i];
+    }
+    // k is hull size+1 (last duplicates first). Ensure at least 2.
+    int hs = (k<2)?2:k;
+    npy_intp dims[2] = {hs, 2};
+    PyArrayObject* out = (PyArrayObject*)PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+    if (!out) { PyMem_Free(pts); PyMem_Free(H); return NULL; }
+    double* o = (double*)PyArray_DATA(out);
+    for (int i=0;i<hs;i++) { o[2*i]=H[i].x; o[2*i+1]=H[i].y; }
+    PyMem_Free(pts); PyMem_Free(H);
+    return (PyObject*)out;
 }
