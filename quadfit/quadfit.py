@@ -1,16 +1,11 @@
 from __future__ import annotations
 
 from shapely import GeometryCollection
-from shapely.geometry import Polygon, mapping, LineString
-from scipy.optimize import minimize
+from shapely.geometry import Polygon, LineString
 import numpy as np
 from warnings import warn
-from itertools import combinations
-from random import sample
 
 from quadfitmodule import Line as _Line  # C extension
-from quadfitmodule import polygon_vertices_from_lines as _poly_from_lines  # C helper
-from quadfitmodule import order_points_clockwise as _order_pts  # C helper
 from quadfitmodule import best_iou_quadrilateral as _best_iou_quad  # C accelerated
 from quadfitmodule import finetune_quadrilateral as _finetune_quad  # C accelerated
 from quadfitmodule import expand_quadrilateral as _expand_quad  # C accelerated
@@ -73,9 +68,8 @@ class QuadrilateralFitter:
 
         self._line_equations = None
         self.fitted_quadrilateral = None
-
         self._expanded_line_equations = None
-        self.expanded_fitted_quadrilateral = None
+        self.expanded_quadrilateral = None
 
     def fit(self, simplify_polygons_larger_than: int|None = 10, start_simplification_epsilon: float = 0.1,
             max_simplification_epsilon: float = 0.5, simplification_epsilon_increment: float = 0.02) -> \
@@ -173,30 +167,6 @@ class QuadrilateralFitter:
         self._line_equations = tuple(lines_obj)
         return tuple(map(tuple, new_vertices))
 
-    def __linear_regression(self, points: np.ndarray, initial_guess: _Line = None) -> _Line:
-        """
-        Internal method that fits a line from a set of points using linear regression.
-        :param points: np.ndarray. A numpy array of shape (N, 2) representing the points to fit the line to. Format X,Y
-        :param initial_guess: _Line. An initial guess for the line equation. If None, the method will use the
-                        linear regression method to find the best possible line.
-        :return: _Line. A _Line object representing the fitted line.
-        """
-
-        def perpendicular_distance(params, points: np.ndarray):
-            a, b, c = params
-            x, y = points[:, 0], points[:, 1]
-            return np.sum(np.abs(a * x + b * y + c)) / np.sqrt(a * a + b * b)
-
-        if initial_guess is None:
-            initial_guess = (1., -1., 0.)
-        else:
-            initial_guess = (initial_guess.A, initial_guess.B, initial_guess.C)
-
-        result = minimize(perpendicular_distance, initial_guess, args=(points,), method='Nelder-Mead')
-        A, B, C = result.x
-
-        return _Line(A=A, B=B, C=C)
-
     def __expand_quadrilateral(self) -> Polygon:
         """
         Internal method that expands the initial quadrilateral approximation to make sure it contains all the vertices
@@ -215,77 +185,14 @@ class QuadrilateralFitter:
         hull_coords = np.array(self.convex_hull_polygon.exterior.coords, dtype=np.float64)
         lines_obj, vertices = _expand_quad(self._line_equations, hull_coords)
         self._expanded_line_equations = tuple(lines_obj)
-        return tuple(map(tuple, vertices))
+        quad = tuple(map(tuple, vertices))
+        self.expanded_quadrilateral = quad
+        return quad
 
-    def __find_polygon_vertices_from_lines(self, line_equations: tuple[_Line]) -> tuple[tuple[float, float], ...]:
-        """
-        Internal method to calculate the vertices of a polygon from a tuple of line equations.
-
-        :param line_equations: tuple[_Line]. A tuple of _Line objects representing the sides of the polygon.
-        :return: tuple[tuple[float, float], ...]. A tuple of tuples representing the vertices of the polygon.
-        """
-        # Użyj C-helpera do przecięć, a następnie uporządkuj wierzchołki zgodnie z ruchem wskazówek zegara w C
-        pts = _poly_from_lines(line_equations)
-        arr = np.array(pts, dtype=np.float64)
-        ordered = _order_pts(arr)
-        return tuple(map(tuple, ordered))
-
-    def __order_points_clockwise(self, pts: np.ndarray | tuple[tuple[float, float], ...]) -> tuple[tuple[float, float], ...]:
-        """
-        Internal method to order points clockwise.
-
-        :param pts: np.ndarray | tuple[tuple[float, float], ...]. The points to be ordered.
-        :return: tuple[tuple[float, float], ...]. The points ordered clockwise.
-        """
-        # Delegacja do implementacji C
-        as_np = isinstance(pts, np.ndarray)
-        arr = pts if as_np else np.array(pts, dtype=np.float64)
-        ordered = _order_pts(arr)
-        if as_np:
-            return ordered
-        return tuple(map(tuple, ordered))
-
-    @staticmethod
-    def __polygon_vertices_to_line_equations(polygon: Polygon) -> tuple[_Line]:
-        """
-        Internal static method to convert Polygons to a tuple of line equations.
-
-        :param polygon: Polygon. A Shapely Polygon object.
-        :return: tuple[_Line]. A tuple of _Line objects representing the sides of the polygon.
-        """
-        assert isinstance(polygon, Polygon), f"Expected a Shapely Polygon, got {type(polygon)} instead."
-        coords = polygon.exterior.coords
-        # Loop through each pair of vertices to calculate the line equations (Last coord is same as first (Shapely))
-        return tuple(_Line(x1=x1, y1=y1, x2=x2, y2=y2)
-                     for (x1, y1), (x2, y2) in zip(coords[:-1], coords[1:]))
-
-    def __move_line_to_contain_all_points(self, line: _Line, polygon: Polygon) -> bool:
-        """
-        Internal method to move a line until it contains all points in the Convex Hull.
-
-        :param line: _Line. The line to be moved.
-        :param polygon: Polygon. The polygon to be contained by the line after moving it.
-
-        :return: bool. True if the line was moved, False otherwise.
-        """
-        centroid = polygon.centroid
-        centroid_sign = self.__sign(x=line.point_line_position(x=centroid.x, y=centroid.y))
-        assert centroid_sign != 0, "The centroid of the polygon should never be on the line."
-
-        max_distance, best_point = 0., None
-
-        for (x, y) in self.convex_hull_polygon.exterior.coords[:-1]:
-            point_position = line.point_line_position(x=x, y=y)
-            if self.__sign(x=point_position) != centroid_sign:
-                distance = line.distance_from_point(x=x, y=y)
-                if distance > max_distance:
-                    max_distance, best_point = distance, (x, y)
-
-        if best_point is not None:
-            x, y = best_point
-            line.move_line_to_intersect_point(x=x, y=y)
-            return True
-        return False
+    # Backward-compat alias used by some examples/tests
+    @property
+    def tight_quadrilateral(self):
+        return getattr(self, "expanded_quadrilateral", None)
 
 
     # -------------------------------- HELPER METHODS -------------------------------- #
