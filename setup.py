@@ -6,7 +6,7 @@ extra_compile_args = ["/O2"] if sys.platform == "win32" else ["-O3", "-std=c99",
 
 ext = Extension(
     "quadfit",
-    sources=["quadrilateral_fitter/quadfitmodule.c"],
+    sources=["quadfit/quadfitmodule.c"],
     include_dirs=[],
     extra_compile_args=extra_compile_args,
 )

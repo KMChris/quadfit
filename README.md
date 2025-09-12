@@ -22,7 +22,7 @@ pip install quadfit
 There is only one line you need to use **QuadrilateralFitter**:
 
 ```python
-from quadrilateral_fitter import QuadrilateralFitter
+from quadfit import QuadrilateralFitter
 
 # Fit an input polygon of N sides
 fitted_quadrilateral = QuadrilateralFitter(polygon=your_noisy_polygon).fit()
@@ -83,7 +83,7 @@ noisy_corners[:, 1] = np.clip(noisy_corners[:, 1], a_min=0., a_max=image.shape[0
 And now, let's run **QuadrilateralFitter** to find the quadrilateral that best approximates our noisy detection (without leaving points outside).
 
 ```python
-from quadrilateral_fitter import QuadrilateralFitter
+from quadfit import QuadrilateralFitter
 
 # Define the fitter (we want to keep it for reading internal variables later)
 fitter = QuadrilateralFitter(polygon=noisy_corners)
