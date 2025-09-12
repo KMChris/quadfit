@@ -76,6 +76,9 @@ QuadrilateralFitter.fit(
     max_initial_combinations: int = 300,
   random_seed: int | None = None,
   until: Literal["initial", "refined", "final"] = "final",
+  # new knobs
+  auto_scale_simplification: bool = True,
+  max_points_for_refinement: int | None = None,
 ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]
 ```
 
@@ -84,6 +87,8 @@ QuadrilateralFitter.fit(
 - `max_initial_combinations`: Limits the number of candidate quadrilaterals tested when searching the initial guess. If 0 or larger than the total number of combinations C(N,4), a full search is performed. Otherwise, up to this many unique combinations are sampled randomly. Default: 300.
 - `random_seed`: RNG seed for deterministic sampling when `max_initial_combinations` is used. Default: None.
 - `until`: Choose how far the pipeline should run for performance. `"initial"` returns only the initial guess, skipping finetune/expansion. `"refined"` runs TLS finetuning but skips final expansion. `"final"` runs the full pipeline. Default: `"final"`.
+- `auto_scale_simplification`: If `True`, scales Douglas–Peucker epsilon parameters by the input size (bounding box diagonal) when epsilons look relative (<= 1). Helps keep simplification consistent across scales. Default: `True`.
+- `max_points_for_refinement`: Optional cap for the number of points used in the TLS finetuning stage. If the input has more points, a deterministic subsample is used (or RNG with `random_seed`). This can dramatically reduce runtime on very large point clouds with minimal accuracy loss. Default: `None` (use all points).
 
 **Returns**: A 4-vertex quadrilateral (clockwise) for the requested stage:
 - `until="initial"`: best IoU vs convex hull (may not contain all points)
@@ -164,3 +169,14 @@ for quadrilateral in (fitted_quadrilateral, tight_quadrilateral):
   <img alt="Corrected Perspective Fitted" title="Corrected Perspective Fitted" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/corrected_perspective_fitted.png" height="230px">
   <img alt="Corrected Perspective Tight" title="Corrected Perspective Tight" src="https://raw.githubusercontent.com/KMChris/quadfit/main/resources/corrected_perspective_tight.png" height="230px">
 </div>
+
+### Performance debugging
+
+The last `fit()` call stores a simple timing breakdown (in seconds) accessible via `fitter.timings`:
+
+```python
+fitter = QuadrilateralFitter(polygon=points)
+fitter.fit()
+print(fitter.timings)
+# Example keys: 'initial_total', 'initial_simplify_dp', 'initial_best_iou', 'refine_total', 'expand_total'
+```

@@ -2,12 +2,14 @@ from __future__ import annotations
 import numpy as np
 from warnings import warn
 from typing import Literal
+import time
 
 from quadfitmodule import best_iou_quadrilateral as _best_iou_quad  # C accelerated
 from quadfitmodule import finetune_quadrilateral as _finetune_quad  # C accelerated
 from quadfitmodule import expand_quadrilateral as _expand_quad  # C accelerated
 from quadfitmodule import simplify_polygon_dp as _simplify_dp  # C accelerated
 from quadfitmodule import convex_hull_monotone as _convex_hull  # C accelerated
+from quadfitmodule import convex_polygon_iou as _convex_iou  # C accelerated
 
 
 
@@ -61,17 +63,25 @@ class QuadrilateralFitter:
 
         # Compute convex hull once in C for hot-path
         self._hull_coords = _convex_hull(self._polygon_coords)
+        # Cache bbox/scale info for heuristics
+        self._min_xy = self._hull_coords.min(axis=0)
+        self._max_xy = self._hull_coords.max(axis=0)
+        self._diag = float(np.linalg.norm(self._max_xy - self._min_xy))
         # Internal state for staged results
         self._initial_quadrilateral: tuple | None = None
         self._refined_quadrilateral: tuple | None = None
         self._final_quadrilateral: tuple | None = None
         self._line_equations = None
         self._expanded_line_equations = None
+        self._timings: dict[str, float] = {}
 
     def fit(self, simplify_polygons_larger_than: int|None = 10, start_simplification_epsilon: float = 0.1,
         max_simplification_epsilon: float = 0.5, simplification_epsilon_increment: float = 0.02,
         max_initial_combinations: int = 300, random_seed: int | None = None,
-        until: Literal["initial", "refined", "final"] = "final") -> tuple:
+        until: Literal["initial", "refined", "final"] = "final",
+        *,
+        auto_scale_simplification: bool = True,
+        max_points_for_refinement: int | None = None) -> tuple:
         """
         Fit a quadrilateral around the input polygon/point-cloud.
 
@@ -91,10 +101,12 @@ class QuadrilateralFitter:
         - random_seed: RNG seed for deterministic sampling when the search is capped.
 
         Returns:
-        - A tuple of four (x, y) points (clockwise) for the requested stage specified by `until`.
+        - A tuple of four (x, y) points (CCW) for the requested stage specified by `until`.
         """
         if until not in ("initial", "refined", "final"):
             raise ValueError("until must be one of: 'initial', 'refined', 'final'")
+        self._timings = {}
+        t0 = time.perf_counter()
         self._initial_quadrilateral = self.__find_initial_quadrilateral(
             max_sides_to_simplify=simplify_polygons_larger_than,
             start_simplification_epsilon=start_simplification_epsilon,
@@ -102,19 +114,26 @@ class QuadrilateralFitter:
             simplification_epsilon_increment=simplification_epsilon_increment,
             max_combinations=max_initial_combinations,
             random_seed=random_seed,
+            auto_scale_simplification=auto_scale_simplification,
         )
+        self._timings["initial_total"] = time.perf_counter() - t0
         if until == "initial":
             # Skip later stages, return initial only
             self._refined_quadrilateral = None
             self._final_quadrilateral = None
             return self._initial_quadrilateral
 
-        self._refined_quadrilateral = self.__finetune_guess()
+        t1 = time.perf_counter()
+        self._refined_quadrilateral = self.__finetune_guess(max_points_for_refinement=max_points_for_refinement,
+                                                            random_seed=random_seed)
+        self._timings["refine_total"] = time.perf_counter() - t1
         if until == "refined":
             self._final_quadrilateral = None
             return self._refined_quadrilateral
 
+        t2 = time.perf_counter()
         self._final_quadrilateral = self.__expand_quadrilateral()
+        self._timings["expand_total"] = time.perf_counter() - t2
         return self._final_quadrilateral
 
 
@@ -123,7 +142,8 @@ class QuadrilateralFitter:
                                      max_simplification_epsilon: float = 0.5,
                                      simplification_epsilon_increment: float = 0.02,
                                      max_combinations: int = 300,
-                                     random_seed: int | None = None) -> tuple:
+                                     random_seed: int | None = None,
+                                     auto_scale_simplification: bool = True) -> tuple:
         """
         Compute the initial quadrilateral from convex-hull vertices.
 
@@ -133,24 +153,51 @@ class QuadrilateralFitter:
 
         Returns: tuple of four (x, y) points (clockwise) for the initial quadrilateral.
         """
-        if max_sides_to_simplify is None:
-            hull_coords = self._hull_coords
-        else:
-            hull_coords = self._hull_coords
-            simp = _simplify_dp(
-                hull_coords,
-                max_sides_to_simplify,
-                start_simplification_epsilon,
-                max_simplification_epsilon,
-                simplification_epsilon_increment,
-                0.8,
-            )
-            hull_coords = np.asarray(simp, dtype=np.float64)
+        t0 = time.perf_counter()
+        hull_coords = self._hull_coords
 
+        # Early exit: if convex hull already has exactly 4 unique vertices, use them.
+        # Note: _convex_hull returns a closed ring (H+1,2) with last==first.
+        if hull_coords.shape[0] >= 5:
+            unique_vertex_count = hull_coords.shape[0] - 1
+            if unique_vertex_count == 4:
+                self._timings["initial_early_exit_hull4"] = time.perf_counter() - t0
+                return tuple(map(tuple, hull_coords[:-1]))
+
+        # Optionally simplify hull before initial search; auto-scale epsilons to data scale if values look relative
+        if max_sides_to_simplify is not None:
+            # If hull already small enough, skip simplification
+            unique_vertex_count = hull_coords.shape[0] - 1 if hull_coords.shape[0] > 0 else 0
+            if unique_vertex_count <= max_sides_to_simplify:
+                pass
+            else:
+                seps = start_simplification_epsilon
+                meps = max_simplification_epsilon
+                incr = simplification_epsilon_increment
+                if auto_scale_simplification and self._diag > 5.0 and meps <= 1.0:
+                    scale = self._diag
+                    seps = seps * scale
+                    meps = meps * scale
+                    incr = incr * scale
+                ts = time.perf_counter()
+                simp = _simplify_dp(
+                    hull_coords,
+                    max_sides_to_simplify,
+                    seps,
+                    meps,
+                    incr,
+                    0.8,
+                )
+                self._timings["initial_simplify_dp"] = time.perf_counter() - ts
+                hull_coords = np.asarray(simp, dtype=np.float64)
+
+        tb = time.perf_counter()
         quad_vertices = _best_iou_quad(hull_coords, max_combinations, random_seed)
+        self._timings["initial_best_iou"] = time.perf_counter() - tb
+        self._timings["initial_compute_total"] = time.perf_counter() - t0
         return tuple(map(tuple, quad_vertices))
 
-    def __finetune_guess(self) -> tuple:
+    def __finetune_guess(self, *, max_points_for_refinement: int | None = None, random_seed: int | None = None) -> tuple:
         """
         Finetune the quadrilateral by reassigning points to sides and fitting TLS lines.
 
@@ -159,6 +206,17 @@ class QuadrilateralFitter:
 
         # Use C accelerated finetuning: assign points to nearest side and fit TLS lines
         points = np.asarray(self._polygon_coords, dtype=np.float64)
+        # Optional downsampling to speed up TLS on very large point clouds
+        if max_points_for_refinement is not None and points.shape[0] > max_points_for_refinement:
+            n = points.shape[0]
+            m = int(max(4, max_points_for_refinement))
+            if random_seed is not None:
+                rng = np.random.default_rng(random_seed)
+                idx = np.sort(rng.choice(n, size=m, replace=False))
+            else:
+                step = n / m
+                idx = (np.arange(m) * step).astype(int)
+            points = points[idx]
         initv = np.array(self._initial_quadrilateral, dtype=np.float64)
         lines_obj, new_vertices = _finetune_quad(points, initv)
         # Store lines as Line objects
@@ -180,3 +238,21 @@ class QuadrilateralFitter:
         quad = tuple(map(tuple, vertices))
         self._final_quadrilateral = quad
         return quad
+
+    @property
+    def timings(self) -> dict:
+        """Return last fit timing breakdown (seconds) if collected."""
+        return dict(self._timings)
+
+    def iou_vs_hull(self, quad: tuple | None = None) -> float:
+        """Compute IoU between provided quadrilateral (or last stage) and the convex hull.
+
+        If quad is None, uses the best available: final -> refined -> initial.
+        """
+        if quad is None:
+            quad = self._final_quadrilateral or self._refined_quadrilateral or self._initial_quadrilateral
+        if quad is None:
+            raise RuntimeError("No quadrilateral available yet; call fit() or pass quad explicitly.")
+        q = np.asarray(quad, dtype=np.float64)
+        h = np.asarray(self._hull_coords, dtype=np.float64)
+        return float(_convex_iou(q, h))

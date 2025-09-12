@@ -47,6 +47,11 @@ def plot_fitter(fitter: QuadrilateralFitter):
         ix, iy = zip(*fitter._initial_quadrilateral)
         plt.plot(ix + (ix[0],), iy + (iy[0],), linestyle='--', alpha=0.5, color='green', label='Initial Guess')
 
+    # Refined quadrilateral (after TLS) if present
+    if getattr(fitter, "_refined_quadrilateral", None) is not None:
+        rx, ry = zip(*fitter._refined_quadrilateral)
+        plt.plot(rx + (rx[0],), ry + (ry[0],), linestyle='-.', alpha=0.7, color='blue', label='Refined (TLS)')
+
     # Final quadrilateral if present
     if fitter._final_quadrilateral is not None:
         x, y = zip(*fitter._final_quadrilateral)
@@ -56,7 +61,21 @@ def plot_fitter(fitter: QuadrilateralFitter):
     plt.axis('equal')
     plt.xlabel('X')
     plt.ylabel('Y')
-    plt.title('Quadrilateral Fitting')
+    # IoU metrics if available
+    title = 'Quadrilateral Fitting'
+    try:
+        if fitter._initial_quadrilateral is not None:
+            iou_init = fitter.iou_vs_hull(fitter._initial_quadrilateral)
+            title += f" | IoU init={iou_init:.3f}"
+        if getattr(fitter, "_refined_quadrilateral", None) is not None:
+            iou_ref = fitter.iou_vs_hull(fitter._refined_quadrilateral)
+            title += f", refined={iou_ref:.3f}"
+        if fitter._final_quadrilateral is not None:
+            iou_fin = fitter.iou_vs_hull(fitter._final_quadrilateral)
+            title += f", final={iou_fin:.3f}"
+    except Exception:
+        pass
+    plt.title(title)
     plt.legend()
     ax = plt.gca()
     ax.invert_yaxis()
@@ -82,10 +101,19 @@ def benchmark_case(name: str, data: np.ndarray, repeats: int = 3, simplify_polyg
         return arr.mean(axis=0)
 
     ai, ar, af = avg(results["initial"]), avg(results["refined"]), avg(results["final"])
+    # Compute IoU for each stage once (not averaged) for a representative run
+    f = QuadrilateralFitter(polygon=data)
+    q_init = f.fit(simplify_polygons_larger_than=simplify_polygons_larger_than, until="initial")
+    iou_init = f.iou_vs_hull(q_init)
+    q_ref = f.fit(simplify_polygons_larger_than=simplify_polygons_larger_than, until="refined")
+    iou_ref = f.iou_vs_hull(q_ref)
+    q_fin = f.fit(simplify_polygons_larger_than=simplify_polygons_larger_than, until="final")
+    iou_fin = f.iou_vs_hull(q_fin)
+
     print(f"\nBenchmark: {name} (N={len(data)})  repeats={repeats}")
-    print(f"  until=initial -> init: {ai[0]:.6f}s, fit: {ai[1]:.6f}s, total: {ai[2]:.6f}s")
-    print(f"  until=refined -> init: {ar[0]:.6f}s, fit: {ar[1]:.6f}s, total: {ar[2]:.6f}s")
-    print(f"  until=final   -> init: {af[0]:.6f}s, fit: {af[1]:.6f}s, total: {af[2]:.6f}s")
+    print(f"  until=initial -> init: {ai[0]:.6f}s, fit: {ai[1]:.6f}s, total: {ai[2]:.6f}s | IoU={iou_init:.3f}")
+    print(f"  until=refined -> init: {ar[0]:.6f}s, fit: {ar[1]:.6f}s, total: {ar[2]:.6f}s | IoU={iou_ref:.3f}")
+    print(f"  until=final   -> init: {af[0]:.6f}s, fit: {af[1]:.6f}s, total: {af[2]:.6f}s | IoU={iou_fin:.3f}")
 
 if __name__ == '__main__':
     # 1. Deformed trapezoid
@@ -134,10 +162,9 @@ if __name__ == '__main__':
 
     # Benchmarks: compare until=initial/refined/final timings
     for name, data in test_data:
-        benchmark_case(name, np.asarray(data, dtype=float), repeats=3)
+        benchmark_case(name, np.asarray(data, dtype=float), repeats=10)
 
     for _, data in test_data:
         fitter = QuadrilateralFitter(polygon=np.asarray(data, dtype=float))
-        # Full pipeline
-    quad = fitter.fit()
-    plot_fitter(fitter)
+        quad = fitter.fit()
+        plot_fitter(fitter)

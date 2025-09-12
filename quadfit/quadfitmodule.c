@@ -347,6 +347,7 @@ static PyObject* mod_finetune_quadrilateral(PyObject* self, PyObject* args, PyOb
 static PyObject* mod_expand_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs);
 static PyObject* mod_simplify_polygon_dp(PyObject* self, PyObject* args, PyObject* kwargs);
 static PyObject* mod_convex_hull_monotone(PyObject* self, PyObject* args, PyObject* kwargs);
+static PyObject* mod_convex_polygon_iou(PyObject* self, PyObject* args, PyObject* kwargs);
 
 static PyMethodDef module_methods[] = {
     {"order_points_clockwise", (PyCFunction)mod_order_points_clockwise, METH_VARARGS, "Order Nx2 points by angle around centroid (CCW)"},
@@ -356,6 +357,7 @@ static PyMethodDef module_methods[] = {
     {"expand_quadrilateral", (PyCFunction)mod_expand_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Push lines outward to cover the hull; return updated (lines, CCW vertices)"},
     {"simplify_polygon_dp", (PyCFunction)mod_simplify_polygon_dp, METH_VARARGS | METH_KEYWORDS, "Douglas–Peucker simplification for a closed polygon with IoU constraint vs the original (convex) polygon"},
     {"convex_hull_monotone", (PyCFunction)mod_convex_hull_monotone, METH_VARARGS | METH_KEYWORDS, "Compute convex hull (monotone chain). Returns closed ring (H+1,2) with last point equal to first."},
+    {"convex_polygon_iou", (PyCFunction)mod_convex_polygon_iou, METH_VARARGS | METH_KEYWORDS, "IoU of two convex polygons given as Nx2, Mx2 arrays (closed ring allowed)."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -702,115 +704,142 @@ static PyObject* make_line_from_abc(double A, double B, double C) {
     return obj;
 }
 
+// convex_polygon_iou(polyA, polyB) -> float
+// Polygons are expected convex. Accept open (N,2) or closed (N+1,2) with last==first.
+static PyObject* mod_convex_polygon_iou(PyObject* self, PyObject* args, PyObject* kwargs) {
+    static char* kwlist[] = {"polyA", "polyB", NULL};
+    PyObject *Ao=NULL, *Bo=NULL;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO:convex_polygon_iou", kwlist, &Ao, &Bo)) return NULL;
+    PyArrayObject *Aarr=NULL, *Barr=NULL; int Ar=0, Ac=2, Br=0, Bc=2;
+    if (ensure_double_2d(Ao, &Aarr, &Ar, &Ac) < 0) return NULL;
+    if (ensure_double_2d(Bo, &Barr, &Br, &Bc) < 0) { Py_DECREF(Aarr); return NULL; }
+    Pt *A=NULL, *B=NULL; int nA=0, nB=0;
+    if (load_points_from_array(Aarr, &A, &nA, 1) < 0) { Py_DECREF(Aarr); Py_DECREF(Barr); return NULL; }
+    if (load_points_from_array(Barr, &B, &nB, 1) < 0) { Py_DECREF(Aarr); Py_DECREF(Barr); PyMem_Free(A); return NULL; }
+    Py_DECREF(Aarr); Py_DECREF(Barr);
+    if (nA < 3 || nB < 3) { PyMem_Free(A); PyMem_Free(B); PyErr_SetString(PyExc_ValueError, "Polygons must have >=3 vertices"); return NULL; }
+    ensure_ccw(A, nA); ensure_ccw(B, nB);
+    // Intersection polygon
+    Pt* work = (Pt*)PyMem_Malloc(sizeof(Pt)*(size_t)(nA + nB));
+    Pt* out = (Pt*)PyMem_Malloc(sizeof(Pt)*(size_t)(nA + nB));
+    if (!work || !out) { if(work)PyMem_Free(work); if(out)PyMem_Free(out); PyMem_Free(A); PyMem_Free(B); PyErr_NoMemory(); return NULL; }
+    int cn = convex_intersection(A, nA, B, nB, work, out);
+    double areaA = polygon_area_abs(A, nA);
+    double areaB = polygon_area_abs(B, nB);
+    double areaI = (cn>0) ? polygon_area_abs(out, cn) : 0.0;
+    double denom = areaA + areaB - areaI;
+    double iou = (denom > 0.0) ? (areaI / denom) : 0.0;
+    PyMem_Free(work); PyMem_Free(out); PyMem_Free(A); PyMem_Free(B);
+    return PyFloat_FromDouble(iou);
+}
+
+// Helper: absolute twice-triangle area
+static inline double tri_area2(Pt a, Pt b, Pt c) {
+    double s = cross2(b.x - a.x, b.y - a.y, c.x - a.x, c.y - a.y);
+    return (s < 0.0) ? -s : s;
+}
+
 // best_iou_quadrilateral(points, max_combinations=300, seed=None)
+// New faster implementation: maximum-area quadrilateral on convex polygon (CCW order)
 static PyObject* mod_best_iou_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs) {
     static char* kwlist[] = {"points", "max_combinations", "seed", NULL};
-    PyObject* points_obj = NULL; int max_comb = 300; PyObject* seed_obj = NULL;
+    PyObject* points_obj=NULL; int max_comb=300; PyObject* seed_obj=NULL;
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|iO:best_iou_quadrilateral", kwlist, &points_obj, &max_comb, &seed_obj))
         return NULL;
 
-    PyArrayObject* arr = NULL; int rows=0, cols=2;
-    if (ensure_double_2d(points_obj, &arr, &rows, &cols) < 0) return NULL;
-    Pt* hull = NULL; int nh = 0;
-    if (load_points_from_array(arr, &hull, &nh, 1) < 0) { Py_DECREF(arr); return NULL; }
+    PyArrayObject* arr=NULL; int r=0, c=2;
+    if (ensure_double_2d(points_obj, &arr, &r, &c) < 0) return NULL;
+    Pt* H=NULL; int N=0; if (load_points_from_array(arr, &H, &N, 1) < 0) { Py_DECREF(arr); return NULL; }
     Py_DECREF(arr);
-    if (nh < 4) { PyMem_Free(hull); PyErr_SetString(PyExc_ValueError, "Need at least 4 hull points"); return NULL; }
-
-    // Enforce CCW orientation for hull (clip polygon assumes CCW: inside = left of edge)
-    ensure_ccw(hull, nh);
-
+    if (N < 4) {
+        // Return 4 points by repeating
+        npy_intp dims[2] = {4,2};
+        PyArrayObject* out = (PyArrayObject*)PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+        if (!out) { PyMem_Free(H); return NULL; }
+        double* o=(double*)PyArray_DATA(out);
+        for (int i=0;i<4;i++){ Pt p=H[i%N]; o[2*i]=p.x; o[2*i+1]=p.y; }
+        PyMem_Free(H); return (PyObject*)out;
+    }
+    ensure_ccw(H, N);
     if (seed_obj && seed_obj != Py_None) {
         long sd = PyLong_AsLong(seed_obj);
         if (!PyErr_Occurred()) srand((unsigned int)sd);
         else PyErr_Clear();
     }
+    if (N == 4) {
+        npy_intp dims[2] = {4,2};
+        PyArrayObject* out = (PyArrayObject*)PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+        if (!out) { PyMem_Free(H); return NULL; }
+        double* o=(double*)PyArray_DATA(out);
+        for (int i=0;i<4;i++){ o[2*i]=H[i].x; o[2*i+1]=H[i].y; }
+        PyMem_Free(H); return (PyObject*)out;
+    }
 
-    // Precompute hull area
-    double hull_area = polygon_area_abs(hull, nh);
-
-    // Work buffers for intersection
-    Pt* work = (Pt*)PyMem_Malloc(sizeof(Pt) * (size_t)(nh + 4));
-    Pt* inter = (Pt*)PyMem_Malloc(sizeof(Pt) * (size_t)(nh + 4));
-    if (!work || !inter) { PyMem_Free(hull); if(work)PyMem_Free(work); if(inter)PyMem_Free(inter); PyErr_NoMemory(); return NULL; }
-
-    // Count combinations
-    long long N = nh;
-    long long total = (N*(N-1)*(N-2)*(N-3))/24; // C(N,4)
-
-    // Simple container for sampled combos (avoid duplicates by linear search)
+    // Decide path: calipers for full search or small N; else fast sampling by area
+    long long total = ((long long)N*(N-1)*(long long)(N-2)*(N-3))/24; // C(N,4)
     int sample_all = (max_comb <= 0 || (long long)max_comb >= total);
-    int samples = sample_all ? (int)total : max_comb;
+    int use_calipers = sample_all || N <= 1200; // heuristic threshold
 
-    // Allocate best result
-    double best_iou = -1.0; Pt best_pts[4];
+    npy_intp dims[2] = {4,2};
+    PyArrayObject* out = (PyArrayObject*)PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+    if (!out) { PyMem_Free(H); return NULL; }
+    double* o=(double*)PyArray_DATA(out);
 
-    if (sample_all) {
-        for (int i=0;i<nh-3;i++)
-        for (int j=i+1;j<nh-2;j++)
-        for (int k=j+1;k<nh-1;k++)
-        for (int l=k+1;l<nh;l++) {
-            Pt quad[4] = {hull[i], hull[j], hull[k], hull[l]};
-            // Ensure quad is CCW for consistent area and clipping
-            ensure_ccw(quad, 4);
-            double quad_area = polygon_area_abs(quad, 4);
-            int in_n = convex_intersection(quad, 4, hull, nh, work, inter);
-            double inter_area = (in_n>0) ? polygon_area_abs(inter, in_n) : 0.0;
-            double denom = hull_area + quad_area - inter_area;
-            double iou = (denom > 0.0) ? (inter_area / denom) : 0.0;
-            if (iou > best_iou) { best_iou = iou; best_pts[0]=quad[0]; best_pts[1]=quad[1]; best_pts[2]=quad[2]; best_pts[3]=quad[3]; if (iou >= 1.0) goto done_full; }
+    if (use_calipers) {
+        // Duplicate ring for circular indexing
+        Pt* ring = (Pt*)PyMem_Malloc(sizeof(Pt)*(size_t)(2*N));
+        if (!ring) { PyMem_Free(H); Py_DECREF(out); PyErr_NoMemory(); return NULL; }
+        for (int i=0;i<2*N;i++) ring[i]=H[i%N];
+        double bestA = -1.0; int bi=0,bj=1,bk=2,bl=3;
+        for (int i=0;i<N;i++){
+            int limit = i + N;
+            int j = i+1, k = j+1, l = k+1;
+            if (l>=limit) continue;
+            for (; j<limit-2; ++j){
+                if (k<=j) k=j+1;
+                if (l<=k) l=k+1;
+                if (l>=limit) break;
+                while (k+1<limit){
+                    double a1=tri_area2(ring[i],ring[j],ring[k]);
+                    double a2=tri_area2(ring[i],ring[j],ring[k+1]);
+                    if (a2>=a1) k++; else break;
+                }
+                while (l+1<limit){
+                    double b1=tri_area2(ring[j],ring[i],ring[l]);
+                    double b2=tri_area2(ring[j],ring[i],ring[l+1]);
+                    if (b2>=b1) l++; else break;
+                }
+                // area of polygon (i -> j -> k -> l) using triangulation from i
+                double A = tri_area2(ring[i],ring[j],ring[k]) + tri_area2(ring[i],ring[k],ring[l]);
+                if (A > bestA){ bestA=A; bi=i; bj=j; bk=k; bl=l; }
+            }
         }
+        int idx[4] = {bi%N, bj%N, bk%N, bl%N};
+        for (int t=0;t<4;t++){ Pt p=H[idx[t]]; o[2*t]=p.x; o[2*t+1]=p.y; }
+        PyMem_Free(ring); PyMem_Free(H);
+        return (PyObject*)out;
     } else {
-        // Random sampling without strict dedup
-        int picked = 0; int attempts = 0; int max_attempts = samples * 10;
-        // store picked combos in an array for dedup (linear scan)
-        int (*combos)[4] = (int(*)[4])PyMem_Malloc(sizeof(int)*4*(size_t)samples);
-        if (!combos) { PyMem_Free(hull); PyMem_Free(work); PyMem_Free(inter); PyErr_NoMemory(); return NULL; }
-        while (picked < samples && attempts < max_attempts) {
+        // Fast sampling: choose max_comb random 4-tuples, compute area only (quad inside hull)
+        double bestA = -1.0; int best_idx[4] = {0,1,2,3};
+        for (int s=0; s<max_comb; ++s) {
             int idx[4];
-            // draw 4 distinct indices
+            // draw 4 distinct indices and sort
             for (;;) {
-                idx[0] = rand()%nh;
-                idx[1] = rand()%nh;
-                idx[2] = rand()%nh;
-                idx[3] = rand()%nh;
-                // ensure distinct
-                int ok=1; for (int a=0;a<4;a++) for (int b=a+1;b<4;b++) if (idx[a]==idx[b]) { ok=0; break; }
+                idx[0] = rand()%N; idx[1] = rand()%N; idx[2] = rand()%N; idx[3] = rand()%N;
+                int ok = 1; for (int a=0;a<4;a++) for (int b=a+1;b<4;b++) if (idx[a]==idx[b]) { ok=0; break; }
                 if (!ok) continue;
                 // sort ascending
                 for (int a=0;a<3;a++) for (int b=a+1;b<4;b++) if (idx[a]>idx[b]) { int t=idx[a]; idx[a]=idx[b]; idx[b]=t; }
-                // check duplicate
-                ok=1; for (int m=0;m<picked;m++) {
-                    if (combos[m][0]==idx[0] && combos[m][1]==idx[1] && combos[m][2]==idx[2] && combos[m][3]==idx[3]) { ok=0; break; }
-                }
-                if (ok) break;
+                break;
             }
-            combos[picked][0]=idx[0]; combos[picked][1]=idx[1]; combos[picked][2]=idx[2]; combos[picked][3]=idx[3];
-            picked++; attempts++;
+            Pt q[4] = { H[idx[0]], H[idx[1]], H[idx[2]], H[idx[3]] };
+            // area of polygon q in ring order is 0.5*(tri_area2(q0,q1,q2)+tri_area2(q0,q2,q3))
+            double A = tri_area2(q[0],q[1],q[2]) + tri_area2(q[0],q[2],q[3]);
+            if (A > bestA) { bestA = A; best_idx[0]=idx[0]; best_idx[1]=idx[1]; best_idx[2]=idx[2]; best_idx[3]=idx[3]; }
         }
-        for (int m=0;m<picked;m++) {
-            int i=combos[m][0], j=combos[m][1], k=combos[m][2], l=combos[m][3];
-            Pt quad[4] = {hull[i], hull[j], hull[k], hull[l]};
-            ensure_ccw(quad, 4);
-            double quad_area = polygon_area_abs(quad, 4);
-            int in_n = convex_intersection(quad, 4, hull, nh, work, inter);
-            double inter_area = (in_n>0) ? polygon_area_abs(inter, in_n) : 0.0;
-            double denom = hull_area + quad_area - inter_area;
-            double iou = (denom > 0.0) ? (inter_area / denom) : 0.0;
-            if (iou > best_iou) { best_iou = iou; best_pts[0]=quad[0]; best_pts[1]=quad[1]; best_pts[2]=quad[2]; best_pts[3]=quad[3]; if (iou >= 1.0) { PyMem_Free(combos); goto done_full; } }
-        }
-        PyMem_Free(combos);
-    }
-done_full:
-    {
-        PyObject* out = PyTuple_New(4);
-        if (!out) { PyMem_Free(hull); PyMem_Free(work); PyMem_Free(inter); return NULL; }
-        for (int i=0;i<4;i++) {
-            PyObject* pt = Py_BuildValue("(dd)", best_pts[i].x, best_pts[i].y);
-            if (!pt) { Py_DECREF(out); PyMem_Free(hull); PyMem_Free(work); PyMem_Free(inter); return NULL; }
-            PyTuple_SET_ITEM(out, i, pt);
-        }
-        PyMem_Free(hull); PyMem_Free(work); PyMem_Free(inter);
-        return out;
+        for (int t=0;t<4;t++){ Pt p=H[best_idx[t]]; o[2*t]=p.x; o[2*t+1]=p.y; }
+        PyMem_Free(H);
+        return (PyObject*)out;
     }
 }
 
