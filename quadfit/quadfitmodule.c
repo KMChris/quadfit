@@ -341,9 +341,21 @@ static PyObject* mod_polygon_vertices_from_lines(PyObject *self, PyObject *args)
 
 // ------------------------ Module ------------------------
 
+// Forward declarations for new accelerated functions
+static PyObject* mod_best_iou_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs);
+static PyObject* mod_finetune_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs);
+static PyObject* mod_expand_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs);
+
 static PyMethodDef module_methods[] = {
     {"order_points_clockwise", (PyCFunction)mod_order_points_clockwise, METH_VARARGS, "Order Nx2 points clockwise"},
     {"polygon_vertices_from_lines", (PyCFunction)mod_polygon_vertices_from_lines, METH_VARARGS, "Intersect consecutive lines to polygon vertices (ordered)"},
+    // New high-level accelerated helpers
+    // best_iou_quadrilateral(points: array[N,2], max_combinations: int = 300, seed: int|None = None) -> tuple[(x,y), (x,y), (x,y), (x,y)]
+    // finetune_quadrilateral(points: array[M,2], initial_vertices: array[4,2]) -> (tuple[Line, ...4], tuple[(x,y), ...4])
+    // expand_quadrilateral(lines: tuple[Line, ...4], hull_points: array[K,2]) -> (tuple[Line, ...4], tuple[(x,y), ...4])
+    {"best_iou_quadrilateral", (PyCFunction)mod_best_iou_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Find quadrilateral (from hull vertices) with max IoU vs convex hull"},
+    {"finetune_quadrilateral", (PyCFunction)mod_finetune_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Assign points to nearest side, fit TLS lines, return lines and vertices"},
+    {"expand_quadrilateral", (PyCFunction)mod_expand_quadrilateral, METH_VARARGS | METH_KEYWORDS, "Push lines outward to cover hull, return lines and vertices"},
     {NULL, NULL, 0, NULL}
 };
 
@@ -380,4 +392,476 @@ PyMODINIT_FUNC PyInit_quadfitmodule(void) {
         return NULL;
     }
     return m;
+}
+
+// ------------------------ Accelerated Routines ------------------------
+
+typedef struct { double x, y; } Pt;
+
+static inline double cross2(double ax, double ay, double bx, double by) {
+    return ax*by - ay*bx;
+}
+
+static double polygon_signed_area(const Pt* pts, int n) {
+    double s = 0.0;
+    for (int i=0;i<n;i++) {
+        int j = (i+1==n)?0:(i+1);
+        s += pts[i].x*pts[j].y - pts[j].x*pts[i].y;
+    }
+    return 0.5*s;
+}
+
+static double polygon_area_abs(const Pt* pts, int n) {
+    double a = polygon_signed_area(pts, n);
+    return a < 0 ? -a : a;
+}
+
+// Compute centroid of polygon (non-self-intersecting). Returns 0 on success, -1 if degenerate area.
+static int polygon_centroid(const Pt* pts, int n, double* outx, double* outy) {
+    double A = polygon_signed_area(pts, n);
+    if (A == 0.0) { *outx = pts[0].x; *outy = pts[0].y; return -1; }
+    double cx = 0.0, cy = 0.0;
+    for (int i=0;i<n;i++) {
+        int j = (i+1==n)?0:(i+1);
+        double cross = pts[i].x*pts[j].y - pts[j].x*pts[i].y;
+        cx += (pts[i].x + pts[j].x) * cross;
+        cy += (pts[i].y + pts[j].y) * cross;
+    }
+    cx /= (6.0*A);
+    cy /= (6.0*A);
+    *outx = cx; *outy = cy;
+    return 0;
+}
+
+// Sutherland–Hodgman clipping: clip subject polygon by convex clip polygon half-planes.
+static int clip_polygon_against_edge(const Pt* subj, int sn, Pt a, Pt b, Pt* out) {
+    if (sn <= 0) return 0;
+    // Determine inside test based on clip edge orientation (assume CCW => inside is left side)
+    double ex = b.x - a.x, ey = b.y - a.y;
+    int outn = 0;
+    Pt S = subj[sn-1];
+    double Sc = cross2(ex,ey, S.x - a.x, S.y - a.y);
+    for (int i=0;i<sn;i++) {
+        Pt E = subj[i];
+        double Ec = cross2(ex,ey, E.x - a.x, E.y - a.y);
+        int Ein = (Ec >= 0.0);
+        int Sin = (Sc >= 0.0);
+        if (Ein) {
+            if (!Sin) {
+                // compute intersection S->E with line a->b
+                double sx = S.x, sy = S.y;
+                double ex2 = E.x, ey2 = E.y;
+                double dx1 = ex2 - sx, dy1 = ey2 - sy;
+                double dx2 = ex, dy2 = ey; // b - a
+                double denom = cross2(dx1,dy1, dx2,dy2);
+                Pt It = E; // fallback
+                if (denom != 0.0) {
+                    double t = cross2(a.x - sx, a.y - sy, dx2, dy2) / denom;
+                    It.x = sx + t*dx1;
+                    It.y = sy + t*dy1;
+                }
+                out[outn++] = It;
+            }
+            out[outn++] = E;
+        } else if (Sin) {
+            // leaving, add intersection
+            double sx = S.x, sy = S.y;
+            double ex2 = E.x, ey2 = E.y;
+            double dx1 = ex2 - sx, dy1 = ey2 - sy;
+            double dx2 = ex, dy2 = ey;
+            double denom = cross2(dx1,dy1, dx2,dy2);
+            Pt It = S; // fallback
+            if (denom != 0.0) {
+                double t = cross2(a.x - sx, a.y - sy, dx2, dy2) / denom;
+                It.x = sx + t*dx1;
+                It.y = sy + t*dy1;
+            }
+            out[outn++] = It;
+        }
+        S = E; Sc = Ec;
+    }
+    return outn;
+}
+
+static int convex_intersection(const Pt* A, int na, const Pt* B, int nb, Pt* workbuf, Pt* out) {
+    // workbuf must have capacity at least na+nb
+    int cn = na;
+    for (int i=0;i<na;i++) workbuf[i] = A[i];
+    int wn = cn;
+    Pt* src = workbuf;
+    Pt* dst = out;
+    for (int i=0;i<nb;i++) {
+        Pt a = B[i];
+        Pt b = B[(i+1==nb)?0:(i+1)];
+        wn = clip_polygon_against_edge(src, cn, a, b, dst);
+        // swap buffers
+        Pt* tmp = src; src = dst; dst = tmp;
+        cn = wn;
+        if (cn == 0) break;
+    }
+    // If last result in src, ensure it's in out
+    if (cn > 0 && src != out) {
+        for (int i=0;i<cn;i++) out[i] = src[i];
+    }
+    return cn;
+}
+
+static int ensure_double_2d(PyObject* obj, PyArrayObject** out, int* rows, int* cols) {
+    PyArrayObject* arr = (PyArrayObject*)PyArray_FROM_OTF(obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (!arr) return -1;
+    if (PyArray_NDIM(arr) != 2) { Py_DECREF(arr); PyErr_SetString(PyExc_AssertionError, "Expected 2D array"); return -1; }
+    int r = (int)PyArray_DIM(arr, 0);
+    int c = (int)PyArray_DIM(arr, 1);
+    if (cols && *cols > 0 && c != *cols) {
+        Py_DECREF(arr);
+        PyErr_SetString(PyExc_AssertionError, "Invalid second dimension");
+        return -1;
+    }
+    if (cols) *cols = c; if (rows) *rows = r;
+    *out = arr;
+    return 0;
+}
+
+static int load_points_from_array(PyArrayObject* arr, Pt** out_pts, int* out_n, int drop_last_if_equal) {
+    int r = (int)PyArray_DIM(arr,0);
+    int c = (int)PyArray_DIM(arr,1);
+    if (c != 2) { PyErr_SetString(PyExc_AssertionError, "Array must have 2 columns"); return -1; }
+    double* p = (double*)PyArray_DATA(arr);
+    npy_intp s0 = PyArray_STRIDE(arr,0) / sizeof(double);
+    npy_intp s1 = PyArray_STRIDE(arr,1) / sizeof(double);
+    int n = r;
+    if (drop_last_if_equal && r >= 2) {
+        double x0 = *(p + 0*s0 + 0*s1);
+        double y0 = *(p + 0*s0 + 1*s1);
+        double xl = *(p + (r-1)*s0 + 0*s1);
+        double yl = *(p + (r-1)*s0 + 1*s1);
+        if (x0 == xl && y0 == yl) n = r - 1;
+    }
+    Pt* pts = (Pt*)PyMem_Malloc(sizeof(Pt) * (size_t)n);
+    if (!pts) { PyErr_NoMemory(); return -1; }
+    for (int i=0;i<n;i++) {
+        pts[i].x = *(p + i*s0 + 0*s1);
+        pts[i].y = *(p + i*s0 + 1*s1);
+    }
+    *out_pts = pts; *out_n = n;
+    return 0;
+}
+
+static PyObject* make_line_from_abc(double A, double B, double C) {
+    PyObject* args = PyTuple_New(0);
+    if (!args) return NULL;
+    PyObject* kwargs = Py_BuildValue("{s:d,s:d,s:d}", "A", A, "B", B, "C", C);
+    if (!kwargs) { Py_DECREF(args); return NULL; }
+    PyObject* obj = PyObject_Call((PyObject*)&LineType, args, kwargs);
+    Py_DECREF(args); Py_DECREF(kwargs);
+    return obj;
+}
+
+// best_iou_quadrilateral(points, max_combinations=300, seed=None)
+static PyObject* mod_best_iou_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs) {
+    static char* kwlist[] = {"points", "max_combinations", "seed", NULL};
+    PyObject* points_obj = NULL; int max_comb = 300; PyObject* seed_obj = NULL;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|iO:best_iou_quadrilateral", kwlist, &points_obj, &max_comb, &seed_obj))
+        return NULL;
+
+    PyArrayObject* arr = NULL; int rows=0, cols=2;
+    if (ensure_double_2d(points_obj, &arr, &rows, &cols) < 0) return NULL;
+    Pt* hull = NULL; int nh = 0;
+    if (load_points_from_array(arr, &hull, &nh, 1) < 0) { Py_DECREF(arr); return NULL; }
+    Py_DECREF(arr);
+    if (nh < 4) { PyMem_Free(hull); PyErr_SetString(PyExc_ValueError, "Need at least 4 hull points"); return NULL; }
+
+    if (seed_obj && seed_obj != Py_None) {
+        long sd = PyLong_AsLong(seed_obj);
+        if (!PyErr_Occurred()) srand((unsigned int)sd);
+        else PyErr_Clear();
+    }
+
+    // Precompute hull area
+    double hull_area = polygon_area_abs(hull, nh);
+
+    // Work buffers for intersection
+    Pt* work = (Pt*)PyMem_Malloc(sizeof(Pt) * (size_t)(nh + 4));
+    Pt* inter = (Pt*)PyMem_Malloc(sizeof(Pt) * (size_t)(nh + 4));
+    if (!work || !inter) { PyMem_Free(hull); if(work)PyMem_Free(work); if(inter)PyMem_Free(inter); PyErr_NoMemory(); return NULL; }
+
+    // Count combinations
+    long long N = nh;
+    long long total = (N*(N-1)*(N-2)*(N-3))/24; // C(N,4)
+
+    // Simple container for sampled combos (avoid duplicates by linear search)
+    int sample_all = (max_comb <= 0 || (long long)max_comb >= total);
+    int samples = sample_all ? (int)total : max_comb;
+
+    // Allocate best result
+    double best_iou = -1.0; Pt best_pts[4];
+
+    if (sample_all) {
+        for (int i=0;i<nh-3;i++)
+        for (int j=i+1;j<nh-2;j++)
+        for (int k=j+1;k<nh-1;k++)
+        for (int l=k+1;l<nh;l++) {
+            Pt quad[4] = {hull[i], hull[j], hull[k], hull[l]};
+            double quad_area = polygon_area_abs(quad, 4);
+            int in_n = convex_intersection(quad, 4, hull, nh, work, inter);
+            double inter_area = (in_n>0) ? polygon_area_abs(inter, in_n) : 0.0;
+            double denom = hull_area + quad_area - inter_area;
+            double iou = (denom > 0.0) ? (inter_area / denom) : 0.0;
+            if (iou > best_iou) { best_iou = iou; best_pts[0]=quad[0]; best_pts[1]=quad[1]; best_pts[2]=quad[2]; best_pts[3]=quad[3]; if (iou >= 1.0) goto done_full; }
+        }
+    } else {
+        // Random sampling without strict dedup
+        int picked = 0; int attempts = 0; int max_attempts = samples * 10;
+        // store picked combos in an array for dedup (linear scan)
+        int (*combos)[4] = (int(*)[4])PyMem_Malloc(sizeof(int)*4*(size_t)samples);
+        if (!combos) { PyMem_Free(hull); PyMem_Free(work); PyMem_Free(inter); PyErr_NoMemory(); return NULL; }
+        while (picked < samples && attempts < max_attempts) {
+            int idx[4];
+            // draw 4 distinct indices
+            for (;;) {
+                idx[0] = rand()%nh;
+                idx[1] = rand()%nh;
+                idx[2] = rand()%nh;
+                idx[3] = rand()%nh;
+                // ensure distinct
+                int ok=1; for (int a=0;a<4;a++) for (int b=a+1;b<4;b++) if (idx[a]==idx[b]) { ok=0; break; }
+                if (!ok) continue;
+                // sort ascending
+                for (int a=0;a<3;a++) for (int b=a+1;b<4;b++) if (idx[a]>idx[b]) { int t=idx[a]; idx[a]=idx[b]; idx[b]=t; }
+                // check duplicate
+                ok=1; for (int m=0;m<picked;m++) {
+                    if (combos[m][0]==idx[0] && combos[m][1]==idx[1] && combos[m][2]==idx[2] && combos[m][3]==idx[3]) { ok=0; break; }
+                }
+                if (ok) break;
+            }
+            combos[picked][0]=idx[0]; combos[picked][1]=idx[1]; combos[picked][2]=idx[2]; combos[picked][3]=idx[3];
+            picked++; attempts++;
+        }
+        for (int m=0;m<picked;m++) {
+            int i=combos[m][0], j=combos[m][1], k=combos[m][2], l=combos[m][3];
+            Pt quad[4] = {hull[i], hull[j], hull[k], hull[l]};
+            double quad_area = polygon_area_abs(quad, 4);
+            int in_n = convex_intersection(quad, 4, hull, nh, work, inter);
+            double inter_area = (in_n>0) ? polygon_area_abs(inter, in_n) : 0.0;
+            double denom = hull_area + quad_area - inter_area;
+            double iou = (denom > 0.0) ? (inter_area / denom) : 0.0;
+            if (iou > best_iou) { best_iou = iou; best_pts[0]=quad[0]; best_pts[1]=quad[1]; best_pts[2]=quad[2]; best_pts[3]=quad[3]; if (iou >= 1.0) { PyMem_Free(combos); goto done_full; } }
+        }
+        PyMem_Free(combos);
+    }
+done_full:
+    {
+        PyObject* out = PyTuple_New(4);
+        if (!out) { PyMem_Free(hull); PyMem_Free(work); PyMem_Free(inter); return NULL; }
+        for (int i=0;i<4;i++) {
+            PyObject* pt = Py_BuildValue("(dd)", best_pts[i].x, best_pts[i].y);
+            if (!pt) { Py_DECREF(out); PyMem_Free(hull); PyMem_Free(work); PyMem_Free(inter); return NULL; }
+            PyTuple_SET_ITEM(out, i, pt);
+        }
+        PyMem_Free(hull); PyMem_Free(work); PyMem_Free(inter);
+        return out;
+    }
+}
+
+// finetune_quadrilateral(points, initial_vertices)
+static PyObject* mod_finetune_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs) {
+    static char* kwlist[] = {"points", "initial_vertices", NULL};
+    PyObject* points_obj=NULL; PyObject* initv_obj=NULL;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO:finetune_quadrilateral", kwlist, &points_obj, &initv_obj))
+        return NULL;
+    PyArrayObject *parr=NULL, *ivar=NULL; int pr=0, pc=2, ivr=0, ivc=2;
+    if (ensure_double_2d(points_obj, &parr, &pr, &pc) < 0) return NULL;
+    if (ensure_double_2d(initv_obj, &ivar, &ivr, &ivc) < 0) { Py_DECREF(parr); return NULL; }
+    if (ivr < 4) { Py_DECREF(parr); Py_DECREF(ivar); PyErr_SetString(PyExc_AssertionError, "initial_vertices must be shape (4,2)"); return NULL; }
+    Pt* P=NULL; int NP=0; if (load_points_from_array(parr, &P, &NP, 0) < 0) { Py_DECREF(parr); Py_DECREF(ivar); return NULL; }
+    Pt* V=NULL; int NV=0; if (load_points_from_array(ivar, &V, &NV, 0) < 0) { Py_DECREF(parr); Py_DECREF(ivar); PyMem_Free(P); return NULL; }
+    Py_DECREF(parr); Py_DECREF(ivar);
+    if (NV != 4) { PyMem_Free(P); PyMem_Free(V); PyErr_SetString(PyExc_AssertionError, "initial_vertices must have 4 rows"); return NULL; }
+
+    // Build initial lines L0: V0->V1, L1: V1->V2, L2: V2->V3, L3: V3->V0
+    double A[4], B[4], Cc[4], Nn[4];
+    for (int i=0;i<4;i++) {
+        Pt p0 = V[i]; Pt p1 = V[(i+1)%4];
+        double a = p1.y - p0.y;
+        double b = p0.x - p1.x;
+        double c = p1.x*p0.y - p0.x*p1.y;
+        double norm = sqrt(a*a + b*b); if (norm == 0.0) norm = 1.0;
+        A[i]=a; B[i]=b; Cc[i]=c; Nn[i]=norm;
+    }
+
+    // Assign points to nearest line (by perpendicular distance)
+    int counts[4] = {0,0,0,0};
+    double sumx[4] = {0,0,0,0}, sumy[4] = {0,0,0,0};
+    double sumxx[4] = {0,0,0,0}, sumyy[4] = {0,0,0,0}, sumxy[4] = {0,0,0,0};
+    for (int i=0;i<NP;i++) {
+        double x = P[i].x, y = P[i].y;
+        double bestd = 1e300; int bestk = 0;
+        for (int k=0;k<4;k++) {
+            double val = fabs(A[k]*x + B[k]*y + Cc[k]) / Nn[k];
+            if (val < bestd) { bestd = val; bestk = k; }
+        }
+        counts[bestk]++;
+        sumx[bestk]+=x; sumy[bestk]+=y;
+        sumxx[bestk]+=x*x; sumyy[bestk]+=y*y; sumxy[bestk]+=x*y;
+    }
+
+    // Fit TLS for each group (fallback to initial if insufficient points)
+    for (int k=0;k<4;k++) {
+        if (counts[k] >= 2) {
+            double n = (double)counts[k];
+            double mx = sumx[k]/n, my = sumy[k]/n;
+            double cxx = sumxx[k]/n - mx*mx;
+            double cyy = sumyy[k]/n - my*my;
+            double cxy = sumxy[k]/n - mx*my;
+            // principal component angle
+            double theta = 0.5 * atan2(2.0*cxy, (cxx - cyy));
+            double ct = cos(theta), st = sin(theta);
+            // direction of max variance u = (ct, st); normal n = (-st, ct)
+            double a = -st, b = ct;
+            // In degenerate isotropic case, fall back to previous line
+            double norm = sqrt(a*a + b*b);
+            if (!(norm > 0.0 && isfinite(norm))) {
+                a = A[k]; b = B[k]; norm = Nn[k];
+            }
+            double c = -(a*mx + b*my);
+            // Guard non-finite
+            if (!isfinite(a) || !isfinite(b) || !isfinite(c)) {
+                a = A[k]; b = B[k]; c = Cc[k]; norm = Nn[k];
+            }
+            A[k]=a; B[k]=b; Cc[k]=c; Nn[k]=norm;
+        }
+    }
+
+    // Build Python Lines and intersection vertices
+    PyObject* out_lines = PyTuple_New(4);
+    if (!out_lines) { PyMem_Free(P); PyMem_Free(V); return NULL; }
+    for (int k=0;k<4;k++) {
+        PyObject* L = make_line_from_abc(A[k], B[k], Cc[k]);
+        if (!L) { Py_DECREF(out_lines); PyMem_Free(P); PyMem_Free(V); return NULL; }
+        PyTuple_SET_ITEM(out_lines, k, L);
+    }
+
+    // Intersections of consecutive lines (assuming 4 lines make a polygon)
+    Pt pts[4]; double cx=0.0, cy=0.0;
+    for (int i=0;i<4;i++) {
+        // intersect Li and L(i+1)
+        double A1=A[i], B1=B[i], C1=Cc[i];
+        double A2=A[(i+1)%4], B2=B[(i+1)%4], C2=Cc[(i+1)%4];
+        double det = A1*B2 - A2*B1;
+        if (det == 0.0) { pts[i].x = V[i].x; pts[i].y = V[i].y; }
+        else {
+            pts[i].x = (-C1*B2 + C2*B1)/det;
+            pts[i].y = (-A1*C2 + A2*C1)/det;
+        }
+        cx += pts[i].x; cy += pts[i].y;
+    }
+    cx /= 4.0; cy /= 4.0;
+    // order by angle
+    PtAng ord[4];
+    for (int i=0;i<4;i++) { ord[i].x = pts[i].x; ord[i].y = pts[i].y; ord[i].ang = atan2(pts[i].y - cy, pts[i].x - cx); }
+    qsort(ord, 4, sizeof(PtAng), cmp_ptang);
+    PyObject* out_pts = PyTuple_New(4);
+    if (!out_pts) { Py_DECREF(out_lines); PyMem_Free(P); PyMem_Free(V); return NULL; }
+    for (int i=0;i<4;i++) {
+        PyObject* pt = Py_BuildValue("(dd)", ord[i].x, ord[i].y);
+        if (!pt) { Py_DECREF(out_lines); Py_DECREF(out_pts); PyMem_Free(P); PyMem_Free(V); return NULL; }
+        PyTuple_SET_ITEM(out_pts, i, pt);
+    }
+
+    PyObject* ret = PyTuple_New(2);
+    if (!ret) { Py_DECREF(out_lines); Py_DECREF(out_pts); PyMem_Free(P); PyMem_Free(V); return NULL; }
+    PyTuple_SET_ITEM(ret, 0, out_lines);
+    PyTuple_SET_ITEM(ret, 1, out_pts);
+    PyMem_Free(P); PyMem_Free(V);
+    return ret;
+}
+
+// expand_quadrilateral(lines, hull_points)
+static PyObject* mod_expand_quadrilateral(PyObject* self, PyObject* args, PyObject* kwargs) {
+    static char* kwlist[] = {"lines", "hull_points", NULL};
+    PyObject* seq=NULL; PyObject* pts_obj=NULL;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO:expand_quadrilateral", kwlist, &seq, &pts_obj))
+        return NULL;
+
+    PyObject* fast = PySequence_Fast(seq, "Expected a sequence of Line");
+    if (!fast) return NULL;
+    Py_ssize_t n = PySequence_Fast_GET_SIZE(fast);
+    if (n != 4) { Py_DECREF(fast); PyErr_SetString(PyExc_AssertionError, "Expected 4 lines"); return NULL; }
+    LineObject* Ls[4];
+    for (int i=0;i<4;i++) {
+        PyObject* obj = PySequence_Fast_GET_ITEM(fast, i);
+        if (!PyObject_TypeCheck(obj, &LineType)) { Py_DECREF(fast); PyErr_SetString(PyExc_TypeError, "All items must be Line"); return NULL; }
+        Ls[i] = (LineObject*)obj;
+    }
+
+    PyArrayObject* arr=NULL; int hr=0, hc=2;
+    if (ensure_double_2d(pts_obj, &arr, &hr, &hc) < 0) { Py_DECREF(fast); return NULL; }
+    Pt* H=NULL; int NH=0; if (load_points_from_array(arr, &H, &NH, 1) < 0) { Py_DECREF(arr); Py_DECREF(fast); return NULL; }
+    Py_DECREF(arr);
+    if (NH < 3) { Py_DECREF(fast); PyMem_Free(H); PyErr_SetString(PyExc_ValueError, "Need at least 3 hull points"); return NULL; }
+
+    // Compute centroid of hull
+    double cx=0.0, cy=0.0; polygon_centroid(H, NH, &cx, &cy);
+
+    // Create new Lines as copies and move outward as needed
+    double A[4], B[4], Cc[4];
+    for (int i=0;i<4;i++) { A[i]=Ls[i]->A; B[i]=Ls[i]->B; Cc[i]=Ls[i]->C; }
+    for (int i=0;i<4;i++) {
+        double norm = sqrt(A[i]*A[i] + B[i]*B[i]); if (norm == 0.0) norm = 1.0;
+        double vc = A[i]*cx + B[i]*cy + Cc[i];
+        int signc = (vc > 0) ? 1 : ((vc < 0) ? -1 : 0);
+        if (signc == 0) signc = 1; // fallback
+        double bestd = -1.0; Pt best = {0,0};
+        for (int j=0;j<NH;j++) {
+            Pt p = H[j];
+            double v = A[i]*p.x + B[i]*p.y + Cc[i];
+            int s = (v > 0) ? 1 : ((v < 0) ? -1 : 0);
+            if (s != 0 && s != signc) {
+                double d = fabs(v)/norm;
+                if (d > bestd) { bestd = d; best = p; }
+            }
+        }
+        if (bestd > 0.0) {
+            Cc[i] = -(A[i]*best.x + B[i]*best.y);
+        }
+    }
+
+    // Build Python Lines and vertices
+    PyObject* out_lines = PyTuple_New(4);
+    if (!out_lines) { Py_DECREF(fast); PyMem_Free(H); return NULL; }
+    for (int k=0;k<4;k++) {
+        PyObject* L = make_line_from_abc(A[k], B[k], Cc[k]);
+        if (!L) { Py_DECREF(out_lines); Py_DECREF(fast); PyMem_Free(H); return NULL; }
+        PyTuple_SET_ITEM(out_lines, k, L);
+    }
+
+    Pt pts[4]; double ccx=0.0, ccy=0.0;
+    for (int i=0;i<4;i++) {
+        double A1=A[i], B1=B[i], C1=Cc[i];
+        double A2=A[(i+1)%4], B2=B[(i+1)%4], C2=Cc[(i+1)%4];
+        double det = A1*B2 - A2*B1;
+        if (det == 0.0) { pts[i].x = 0.0; pts[i].y = 0.0; }
+        else {
+            pts[i].x = (-C1*B2 + C2*B1)/det;
+            pts[i].y = (-A1*C2 + A2*C1)/det;
+        }
+        ccx += pts[i].x; ccy += pts[i].y;
+    }
+    ccx /= 4.0; ccy /= 4.0;
+    PtAng ord[4];
+    for (int i=0;i<4;i++) { ord[i].x = pts[i].x; ord[i].y = pts[i].y; ord[i].ang = atan2(pts[i].y - ccy, pts[i].x - ccx); }
+    qsort(ord, 4, sizeof(PtAng), cmp_ptang);
+    PyObject* out_pts = PyTuple_New(4);
+    if (!out_pts) { Py_DECREF(out_lines); Py_DECREF(fast); PyMem_Free(H); return NULL; }
+    for (int i=0;i<4;i++) {
+        PyObject* pt = Py_BuildValue("(dd)", ord[i].x, ord[i].y);
+        if (!pt) { Py_DECREF(out_lines); Py_DECREF(out_pts); Py_DECREF(fast); PyMem_Free(H); return NULL; }
+        PyTuple_SET_ITEM(out_pts, i, pt);
+    }
+    PyObject* ret = PyTuple_New(2);
+    if (!ret) { Py_DECREF(out_lines); Py_DECREF(out_pts); Py_DECREF(fast); PyMem_Free(H); return NULL; }
+    PyTuple_SET_ITEM(ret, 0, out_lines);
+    PyTuple_SET_ITEM(ret, 1, out_pts);
+    Py_DECREF(fast); PyMem_Free(H);
+    return ret;
 }

@@ -11,6 +11,9 @@ from random import sample
 from quadfitmodule import Line as _Line  # C extension
 from quadfitmodule import polygon_vertices_from_lines as _poly_from_lines  # C helper
 from quadfitmodule import order_points_clockwise as _order_pts  # C helper
+from quadfitmodule import best_iou_quadrilateral as _best_iou_quad  # C accelerated
+from quadfitmodule import finetune_quadrilateral as _finetune_quad  # C accelerated
+from quadfitmodule import expand_quadrilateral as _expand_quad  # C accelerated
 
 class QuadrilateralFitter:
     def __init__(self, polygon: np.ndarray | tuple | list | Polygon):
@@ -139,40 +142,17 @@ class QuadrilateralFitter:
 
         :return: Polygon. A Shapely Polygon object representing the initial quadrilateral approximation.
         """
-        best_iou, best_quadrilateral = 0., None  # Variable to store the vertices of the best quadrilateral
-        convex_hull_area = self.convex_hull_polygon.area
-
-        # Simplify the Convex Hull if it has more than simplify_polygons_larger_than vertices
+        # Simplify the Convex Hull optionally (Shapely), then let C do the max-IoU selection among hull vertices
         simplified_polygon = self.__simplify_polygon(polygon=self.convex_hull_polygon,
                                                      max_sides=max_sides_to_simplify,
                                                      initial_epsilon=start_simplification_epsilon,
                                                      max_epsilon=max_simplification_epsilon,
                                                      epsilon_increment=simplification_epsilon_increment)
 
-        all_combinations = tuple(combinations(mapping(simplified_polygon)['coordinates'][0], 4))
-
-        # Limit the number of combinations to max_combinations if it's too large, to speed up the process
-        if len(all_combinations) > max_combinations:
-            all_combinations = sample(all_combinations, max_combinations)
-
-        # Iterate through 4-vertex combinations to form potential quadrilaterals
-        for vertices_combination in all_combinations:
-            current_quadrilateral = Polygon(vertices_combination)
-            assert current_quadrilateral.is_valid, f"Quadrilaterals generated from an ordered Convex Hull should be " \
-                                                       f"always valid."
-
-            # Calculate the Intersection over Union (IoU) between the Convex Hull and the current quadrilateral
-            iou = self.__iou(polygon1=self.convex_hull_polygon, polygon2=current_quadrilateral,
-                             precomputed_polygon_1_area=convex_hull_area)
-
-            if iou > best_iou:
-                best_iou, best_quadrilateral = iou, current_quadrilateral
-                if iou >= 1.:
-                    assert iou == 1., f"IoU should never be > 1.0. Got{iou}"
-                    break  # We found the best possible quadrilateral, so we can stop iterating
-
-        assert best_quadrilateral is not None, "No quadrilateral was found. This should never happen."
-
+        hull_coords = np.array(simplified_polygon.exterior.coords, dtype=np.float64)
+        # C returns 4 vertices; we wrap them as a Shapely Polygon
+        quad_vertices = _best_iou_quad(hull_coords, max_combinations)
+        best_quadrilateral = Polygon(quad_vertices)
         return best_quadrilateral
 
     def __finetune_guess(self) -> Polygon:
@@ -185,21 +165,13 @@ class QuadrilateralFitter:
         :return: Polygon. A Shapely Polygon object representing the finetuned quadrilateral.
         """
 
-        initial_line_equations = self.__polygon_vertices_to_line_equations(polygon=self._initial_guess)
-        # Calculate the distance between each vertex of the input polygon and each line of the quadrilateral
-        distances = np.array(
-            [line.distances_from_points(points=self._polygon_coords) for line in initial_line_equations],
-            dtype=np.float32)
-        # For each point, get the index of the closest line
-        points_line_idx = np.argmin(distances, axis=0)
-
-        self._line_equations = tuple(
-            self.__linear_regression(self._polygon_coords[points_line_idx == i], initial_guess=initial_guess)
-                for i, initial_guess in enumerate(initial_line_equations)
-        )
-
-        new_quadrilateral_vertices = self.__find_polygon_vertices_from_lines(line_equations=self._line_equations)
-        return new_quadrilateral_vertices
+        # Use C accelerated finetuning: assign points to nearest side and fit TLS lines
+        points = np.asarray(self._polygon_coords, dtype=np.float64)
+        initv = np.array(self._initial_guess.exterior.coords[:-1], dtype=np.float64)
+        lines_obj, new_vertices = _finetune_quad(points, initv)
+        # Store lines as Line objects
+        self._line_equations = tuple(lines_obj)
+        return tuple(map(tuple, new_vertices))
 
     def __linear_regression(self, points: np.ndarray, initial_guess: _Line = None) -> _Line:
         """
@@ -239,15 +211,11 @@ class QuadrilateralFitter:
 
         :return: Polygon. A Shapely Polygon object representing the expanded quadrilateral.
         """
-        # 1. Move each line in their orthogonal direction (outwards) until it contains (or intersects)
-        #    all the points of the Convex Hull in its inward direction
-        line_equations = tuple(line.copy() for line in self._line_equations)
-        for line in line_equations:
-            self.__move_line_to_contain_all_points(line=line, polygon=self.convex_hull_polygon)
-        # 3. Find the intersection points between the lines to calculate the vertices of the
-        #    new expanded quadrilateral
-        new_quadrilateral_vertices = self.__find_polygon_vertices_from_lines(line_equations=line_equations)
-        return new_quadrilateral_vertices
+        # Delegate to accelerated C expansion using hull points
+        hull_coords = np.array(self.convex_hull_polygon.exterior.coords, dtype=np.float64)
+        lines_obj, vertices = _expand_quad(self._line_equations, hull_coords)
+        self._expanded_line_equations = tuple(lines_obj)
+        return tuple(map(tuple, vertices))
 
     def __find_polygon_vertices_from_lines(self, line_equations: tuple[_Line]) -> tuple[tuple[float, float], ...]:
         """
