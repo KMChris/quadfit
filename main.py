@@ -1,81 +1,38 @@
 from quadfit import QuadrilateralFitter
 import numpy as np
-import cv2
 from matplotlib import pyplot as plt
 import timeit
 from typing import Iterable, Tuple
 
-def yugioh_test():
-    image = cv2.cvtColor(cv2.imread('./resources/input_sample.jpg'), cv2.COLOR_BGR2RGB)
-    true_corners = np.array([[50., 100.], [370., 0.], [421., 550.], [0., 614.], [50., 100.]], dtype=np.float32)
-
-    # Generate the noisy corners
-    sides = [np.linspace([x1, y1], [x2, y2], 25) + np.random.normal(scale=5, size=(25, 2))
-             for (x1, y1), (x2, y2) in zip(true_corners[:-1], true_corners[1:])]
-    noisy_corners = np.concatenate(sides, axis=0)
-
-    # To simplify, we will clip the corners to be within the image
-    noisy_corners[:, 0] = np.clip(noisy_corners[:, 0], a_min=0., a_max=image.shape[1])
-    noisy_corners[:, 1] = np.clip(noisy_corners[:, 1], a_min=0., a_max=image.shape[0])
-
-    start = timeit.default_timer()
-    fitter = QuadrilateralFitter(polygon=noisy_corners)
-    after_fitter = timeit.default_timer()
-    # If only the initial guess is needed, skip later stages for speed
-    result = fitter.fit(simplify_polygons_larger_than=30, until="initial")
-    after_fit = timeit.default_timer()
-    tight_quadrilateral = result
-    after_tight = timeit.default_timer()
-
-    print(f"QuadrilateralFitter init: {after_fitter - start:.6f} seconds")
-    print(f"fit() call: {after_fit - after_fitter:.6f} seconds")
-    print(f"tight_quadrilateral access: {after_tight - after_fit:.6f} seconds")
-    print(f"Total: {after_tight - start:.6f} seconds")
-
 def plot_fitter(fitter: QuadrilateralFitter):
-    """Plot the input points, convex hull, and any available quadrilaterals from the fitter."""
-    # Input polygon / points
-    pc = fitter._polygon_coords  # internal, but OK for debugging/demo
+    """Simple plot of the fitting process stages."""
+    pc = fitter._polygon_coords
     plt.plot(pc[:, 0], pc[:, 1], alpha=0.3, linestyle='-', marker='o', label='Input Polygon')
 
-    # Convex hull
     hx, hy = fitter._hull_coords[:, 0], fitter._hull_coords[:, 1]
-    plt.fill(hx, hy, alpha=0.4, label='Convex Hull', color='orange')
+    plt.fill(hx, hy, alpha=0.2, label='Convex Hull', color='orange')
 
-    # Initial quadrilateral if present
+    title = 'Quadrilateral Fitting'
     if fitter._initial_quadrilateral is not None:
         ix, iy = zip(*fitter._initial_quadrilateral)
-        plt.plot(ix + (ix[0],), iy + (iy[0],), linestyle='--', alpha=0.5, color='green', label='Initial Guess')
+        plt.plot(ix + (ix[0],), iy + (iy[0],), linestyle='--', alpha=0.6, color='green', label='Initial')
+        title += f" | IoU init={fitter.iou_vs_hull(fitter._initial_quadrilateral):.3f}"
 
-    # Refined quadrilateral (after TLS) if present
-    if getattr(fitter, "_refined_quadrilateral", None) is not None:
+    if fitter._refined_quadrilateral is not None:
         rx, ry = zip(*fitter._refined_quadrilateral)
-        plt.plot(rx + (rx[0],), ry + (ry[0],), linestyle='-.', alpha=0.7, color='blue', label='Refined (TLS)')
+        plt.plot(rx + (rx[0],), ry + (ry[0],), linestyle='-.', alpha=0.7, color='blue', label='Refined')
+        title += f", refined={fitter.iou_vs_hull(fitter._refined_quadrilateral):.3f}"
 
-    # Final quadrilateral if present
     if fitter._final_quadrilateral is not None:
         x, y = zip(*fitter._final_quadrilateral)
-        plt.plot(x + (x[0],), y + (y[0],), label='Final Quadrilateral')
+        plt.plot(x + (x[0],), y + (y[0],), label='Final')
         plt.scatter(x, y, marker='x', color='red')
+        title += f", final={fitter.iou_vs_hull(fitter._final_quadrilateral):.3f}"
 
+    plt.title(title)
     plt.axis('equal')
     plt.xlabel('X')
     plt.ylabel('Y')
-    # IoU metrics if available
-    title = 'Quadrilateral Fitting'
-    try:
-        if fitter._initial_quadrilateral is not None:
-            iou_init = fitter.iou_vs_hull(fitter._initial_quadrilateral)
-            title += f" | IoU init={iou_init:.3f}"
-        if getattr(fitter, "_refined_quadrilateral", None) is not None:
-            iou_ref = fitter.iou_vs_hull(fitter._refined_quadrilateral)
-            title += f", refined={iou_ref:.3f}"
-        if fitter._final_quadrilateral is not None:
-            iou_fin = fitter.iou_vs_hull(fitter._final_quadrilateral)
-            title += f", final={iou_fin:.3f}"
-    except Exception:
-        pass
-    plt.title(title)
     plt.legend()
     ax = plt.gca()
     ax.invert_yaxis()
@@ -101,7 +58,6 @@ def benchmark_case(name: str, data: np.ndarray, repeats: int = 3, simplify_polyg
         return arr.mean(axis=0)
 
     ai, ar, af = avg(results["initial"]), avg(results["refined"]), avg(results["final"])
-    # Compute IoU for each stage once (not averaged) for a representative run
     f = QuadrilateralFitter(polygon=data)
     q_init = f.fit(simplify_polygons_larger_than=simplify_polygons_larger_than, until="initial")
     iou_init = f.iou_vs_hull(q_init)
@@ -111,9 +67,9 @@ def benchmark_case(name: str, data: np.ndarray, repeats: int = 3, simplify_polyg
     iou_fin = f.iou_vs_hull(q_fin)
 
     print(f"\nBenchmark: {name} (N={len(data)})  repeats={repeats}")
-    print(f"  until=initial -> init: {ai[0]:.6f}s, fit: {ai[1]:.6f}s, total: {ai[2]:.6f}s | IoU={iou_init:.3f}")
-    print(f"  until=refined -> init: {ar[0]:.6f}s, fit: {ar[1]:.6f}s, total: {ar[2]:.6f}s | IoU={iou_ref:.3f}")
-    print(f"  until=final   -> init: {af[0]:.6f}s, fit: {af[1]:.6f}s, total: {af[2]:.6f}s | IoU={iou_fin:.3f}")
+    print(f"  until=initial -> init: {ai[0]*1e6:.2f}µs, fit: {ai[1]*1e6:.2f}µs, total: {ai[2]*1e6:.2f}µs | IoU={iou_init:.3f}")
+    print(f"  until=refined -> init: {ar[0]*1e6:.2f}µs, fit: {ar[1]*1e6:.2f}µs, total: {ar[2]*1e6:.2f}µs | IoU={iou_ref:.3f}")
+    print(f"  until=final   -> init: {af[0]*1e6:.2f}µs, fit: {af[1]*1e6:.2f}µs, total: {af[2]*1e6:.2f}µs | IoU={iou_fin:.3f}")
 
 if __name__ == '__main__':
     # 1. Deformed trapezoid
@@ -162,7 +118,7 @@ if __name__ == '__main__':
 
     # Benchmarks: compare until=initial/refined/final timings
     for name, data in test_data:
-        benchmark_case(name, np.asarray(data, dtype=float), repeats=10)
+        benchmark_case(name, np.asarray(data, dtype=float), repeats=10000)
 
     for _, data in test_data:
         fitter = QuadrilateralFitter(polygon=np.asarray(data, dtype=float))
